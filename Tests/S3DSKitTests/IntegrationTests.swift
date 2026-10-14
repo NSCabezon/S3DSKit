@@ -13,11 +13,20 @@ struct IntegrationTests {
     typealias Message = (header: S3DSProtocol.Header, payload: Data)
 
     /// Connects, runs `feed`, waits for the tail to flush, disconnects, validates the stream.
-    func stream(name: String, layout: S3DSLayout,
+    @discardableResult
+    func stream(name: String, layout: S3DSLayout, audio: Bool = false,
                 feed: (S3DSStreamer) async throws -> Void) async throws -> [Message] {
+        try await streamAll(name: name, layout: layout, audio: audio, feed: feed)
+            .filter { $0.header.messageType == .videoAU }
+    }
+
+    /// Like `stream` but returns every message (HELLO, VIDEO_AU, AUDIO) in arrival order.
+    func streamAll(name: String, layout: S3DSLayout, audio: Bool = false,
+                   feed: (S3DSStreamer) async throws -> Void) async throws -> [Message] {
         let receiver = try TestReceiver()
         defer { receiver.stop() }
-        let streamer = S3DSStreamer(configuration: S3DSConfiguration(layout: layout, senderName: "S3DSKitTests"))
+        let streamer = S3DSStreamer(configuration: S3DSConfiguration(layout: layout, senderName: "S3DSKitTests",
+                                                                      audioEnabled: audio))
         #expect(streamer.metalError == nil)
         streamer.connect(host: "127.0.0.1", port: receiver.port)
         let up = await waitUntil { streamer.connectionState == .connected }
@@ -42,6 +51,7 @@ struct IntegrationTests {
             let t = nalTypes(au.payload)
             #expect((au.header.flags & 1 != 0) == t.contains(5))   // flag agrees with content
             #expect(!t.contains(9))                                 // no AUD
+            #expect(t.filter { $0 == 1 || $0 == 5 }.count == 1)     // single slice (3DS MVD)
             if t.contains(5) { #expect(Array(t.prefix(2)) == [7, 8]) }
         }
         #expect(aus.filter { $0.header.flags & 1 != 0 }.count >= 2)   // keyframe interval ≤ 1 s
@@ -50,7 +60,8 @@ struct IntegrationTests {
         try aus.reduce(into: Data()) { $0.append($1.payload) }.write(to: url)
         print("S3DSKIT_DUMP \(name): \(url.path) (\(aus.count) AUs)")
         #expect(streamer.stats.framesSent > 0)
-        return aus
+        if !audio { #expect(!messages.contains { $0.header.messageType == .audio }) }
+        return messages
     }
 
     /// Renders stereo frames with StereoEyeRenderer and submits them into the caller's
@@ -82,9 +93,33 @@ struct IntegrationTests {
         }
     }
 
-    /// Default layout: one eye per frame, L/R alternating, IDR only on left frames.
+    /// Default layout: one eye per frame, L/R alternating, IDR only on left frames; with audio
+    /// (440 Hz mono 48 kHz, fed like an app audio thread) interleaved on the same connection.
     @Test func alternatingStereoStream() async throws {
-        let aus = try await stream(name: "s3ds_alternating", layout: .alternating240x400) { try await feedStereo($0) }
+        let audioFeeder = SineFeeder()
+        let all = try await streamAll(name: "s3ds_alternating", layout: .alternating240x400, audio: true) { streamer in
+            audioFeeder.start(streamer)
+            try await feedStereo(streamer)
+            audioFeeder.stop()
+        }
+        let aus = all.filter { $0.header.messageType == .videoAU }
+
+        // Audio: ~50 packets/s, framing, monotonic timestamps, interleaved with video, decodable.
+        let audio = all.filter { $0.header.messageType == .audio }
+        print("S3DSKIT_AUDIO packets=\(audio.count) video=\(aus.count)")
+        #expect(audio.count >= 80)   // ~2 s of feeding
+        #expect(audio.allSatisfy { $0.header.flags == 0 && $0.payload.count > 8 })
+        let stamps = audio.map { $0.payload.prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) } }
+        #expect(zip(stamps.dropFirst(), stamps).allSatisfy { $0 > $1 })
+        let kinds = all.map(\.header.type)
+        let firstAudio = try #require(kinds.firstIndex(of: 0x03))
+        let lastAudio = try #require(kinds.lastIndex(of: 0x03))
+        let videoBetween = kinds[firstAudio...lastAudio].filter { $0 == 0x01 }.count
+        #expect(videoBetween >= 50, "audio and video should interleave")
+        let decoded = try OpusTestSupport.decode(audio.map { Data($0.payload.dropFirst(8)) })
+        let f = OpusTestSupport.frequency(decoded)
+        #expect(abs(f - 440) < 20, "decoded frequency \(f) Hz")
+
         #expect(aus.count >= 100)
         for (i, au) in aus.enumerated() {
             let f = au.header.flags
@@ -123,7 +158,7 @@ struct IntegrationTests {
             }
         }
         print("S3DSKIT_THROTTLE calls=\(calls) accepted=\(accepted)")
-        #expect(calls > accepted * 2)             // most 90 Hz calls are no-ops
+        #expect(Double(calls) > Double(accepted) * 1.5)   // 60-90 Hz calls; extra ones are no-ops
         #expect(accepted >= 45 && accepted <= 80) // ~30 fps over 2.5 s
         #expect(aus.count >= 80)                  // two AUs per accepted frame
     }
@@ -171,4 +206,40 @@ final class FramePumpShape {
         streamer.submit(left: frame.left, right: frame.right, commandBuffer: cb)
         cb.commit()
     }
+}
+
+/// Feeds a 440 Hz mono sine at 48 kHz from a background thread in ~10 ms chunks, sized by the
+/// wall clock (like an audio render callback).
+final class SineFeeder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running = false
+    private var thread: Thread?
+
+    func start(_ streamer: S3DSStreamer) {
+        lock.lock(); running = true; lock.unlock()
+        let t = Thread { [self] in
+            let rate = 48_000.0
+            let start = CACurrentMediaTime()
+            var written = 0
+            var buffer = [Float](repeating: 0, count: 4800)
+            while isRunning {
+                let due = Int((CACurrentMediaTime() - start) * rate)
+                let n = min(buffer.count, due - written)
+                if n > 0 {
+                    for i in 0..<n { buffer[i] = Float(0.5 * sin(2 * .pi * 440 * Double(written + i) / rate)) }
+                    buffer.withUnsafeBufferPointer {
+                        streamer.submitAudio(samples: UnsafeBufferPointer(rebasing: $0[0..<n]), channels: 1, sampleRate: rate)
+                    }
+                    written += n
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+        thread = t
+        t.start()
+    }
+
+    private var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return running }
+
+    func stop() { lock.lock(); running = false; lock.unlock() }
 }

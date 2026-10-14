@@ -12,7 +12,7 @@ import os
 final class H264Encoder: @unchecked Sendable {
     struct Settings: Sendable {
         var layout: S3DSLayout = .alternating240x400
-        var bitrate: Int = 2_000_000
+        var bitrate: Int = 1_500_000
         /// Stereo pairs per second (the encoder runs at `fps * layout.framesPerPair`).
         var fps: Int = 30
         /// Pairs between keyframes.
@@ -125,9 +125,12 @@ final class H264Encoder: @unchecked Sendable {
                 duration: duration,
                 frameProperties: props,
                 infoFlagsOut: nil
-            ) { status, _, sampleBuffer in
-                guard status == noErr, let sampleBuffer,
-                      let (data, key) = H264Encoder.annexB(from: sampleBuffer) else { return }
+            ) { [weak self] status, _, sampleBuffer in
+                guard status == noErr, let sampleBuffer else { return }
+                guard let (data, key) = H264Encoder.annexB(from: sampleBuffer) else {
+                    self?.forceKeyframe()   // a dropped picture breaks the reference chain
+                    return
+                }
                 if key, eye == .right {
                     H264Encoder.log.warning("encoder produced an IDR on a right-eye frame")
                 }
@@ -174,6 +177,13 @@ final class H264Encoder: @unchecked Sendable {
             if st != noErr { log.warning("VTSessionSetProperty \(key as String) failed: \(st)") }
         }
         set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel)
+        // The 3DS MVD decoder only handles single-slice pictures. VideoToolbox's software H.264
+        // encoder (simulator) splits pictures into 2-5 slices by default; "NumberOfSlices" is listed
+        // by VTSessionCopySupportedPropertyDictionary but has no public constant. Set it where
+        // supported; every output picture is verified in annexB(from:) either way.
+        if Self.supportsProperty(session, Self.numberOfSlicesKey) {
+            set(Self.numberOfSlicesKey, 1 as CFNumber)
+        }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
         let keyDuration = Double(settings.keyframeInterval) / Double(max(1, settings.fps))
@@ -190,6 +200,15 @@ final class H264Encoder: @unchecked Sendable {
         applyBitrate(settings.bitrate, to: session)
         VTCompressionSessionPrepareToEncodeFrames(session)
         return session
+    }
+
+    static var numberOfSlicesKey: CFString { "NumberOfSlices" as CFString }
+
+    private static func supportsProperty(_ session: VTCompressionSession, _ key: CFString) -> Bool {
+        var dict: CFDictionary?
+        guard VTSessionCopySupportedPropertyDictionary(session, supportedPropertyDictionaryOut: &dict) == noErr,
+              let keys = dict as? [String: Any] else { return false }
+        return keys[key as String] != nil
     }
 
     private static func applyBitrate(_ bitrate: Int, to session: VTCompressionSession) {
@@ -237,6 +256,15 @@ final class H264Encoder: @unchecked Sendable {
                 if st == noErr, let ptr { sets.append(Data(bytes: ptr, count: size)) }
             }
             parameterSets = sets
+        }
+        // The 3DS MVD decoder only handles single-slice pictures (multi-slice crashes its sysmodule).
+        // makeSession requests one slice and never sets kVTCompressionPropertyKey_MaxH264SliceBytes;
+        // verify anyway: fatal in DEBUG, dropped (+ IDR requested) and logged in release.
+        let slices = AnnexB.sliceCount(avcc: avcc, nalLengthSize: Int(nalLen)) ?? 0
+        if slices != 1 {
+            log.fault("encoder produced \(slices) slices in one picture; the 3DS requires exactly 1 (frame dropped)")
+            assertionFailure("H.264 access unit has \(slices) slices; the 3DS needs single-slice pictures")
+            return nil
         }
         guard let annexB = AnnexB.convert(avcc: avcc, nalLengthSize: Int(nalLen), parameterSets: parameterSets)
         else { return nil }

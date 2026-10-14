@@ -22,11 +22,13 @@ struct RotateParams {
 enum S3DSKitError: Error, CustomStringConvertible {
     case metal(String)
     case pixelBuffer(CVReturn)
+    case audio(String)
 
     var description: String {
         switch self {
         case .metal(let m): "Metal: \(m)"
         case .pixelBuffer(let r): "CVPixelBuffer error \(r)"
+        case .audio(let m): "Audio: \(m)"
         }
     }
 }
@@ -116,9 +118,10 @@ final class FrameRotator: @unchecked Sendable {
         }
         enc.endEncoding()
 
-        // Keep the CVMetalTextures alive until the GPU is done with them.
-        let keepAlive = UncheckedBox(targets.map(\.1))
-        commandBuffer.addCompletedHandler { _ in _ = keepAlive }
+        // Keep the CVMetalTextures (and their cache, which must outlive them) alive until the GPU
+        // is done, even if the rotator itself is released meanwhile.
+        let lease = TextureLease(textures: targets.map(\.1), cache: textureCache)
+        commandBuffer.addCompletedHandler { _ in lease.end() }
         return targets.map(\.0)
     }
 
@@ -147,6 +150,30 @@ final class FrameRotator: @unchecked Sendable {
         default:
             return true   // *_srgb, rgba16Float, rgba32Float, bgr10_xr_srgb, ...
         }
+    }
+}
+
+/// Holds CVMetalTextures until GPU completion and releases them strictly before their cache
+/// (releasing a CVMetalTexture after its CVMetalTextureCache is gone crashes in CoreVideo).
+final class TextureLease: @unchecked Sendable {
+    private var textures: [CVMetalTexture]?
+    private let cache: CVMetalTextureCache
+    private let lock = NSLock()
+
+    init(textures: [CVMetalTexture], cache: CVMetalTextureCache) {
+        self.textures = textures
+        self.cache = cache
+    }
+
+    func end() {
+        lock.lock()
+        textures = nil
+        lock.unlock()
+    }
+
+    deinit {
+        textures = nil   // before `cache` is released
+        withExtendedLifetime(cache) {}
     }
 }
 

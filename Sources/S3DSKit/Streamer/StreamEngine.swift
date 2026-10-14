@@ -41,6 +41,7 @@ final class StreamEngine: @unchecked Sendable {
     private let fps: Int
     let layout: S3DSLayout
     private let encoder: H264Encoder
+    private let audio: AudioPipeline?
     private let sender: StreamSender
     private let rotator: FrameRotator?
     private let commandQueue: (any MTLCommandQueue)?
@@ -68,6 +69,11 @@ final class StreamEngine: @unchecked Sendable {
             output: { data, isKey, eye in
                 link.sender.withLock { $0 }?.sendVideo(data, isKeyframe: isKey, eye: eye)
             })
+        let audio = configuration.audioEnabled
+            ? AudioPipeline(bitrate: configuration.audioBitrate, output: { packet, micros in
+                link.sender.withLock { $0 }?.sendAudio(packet, timestampMicros: micros)
+            })
+            : nil
         let connected = self.connected
         let continuation = self.continuation
         let sender = StreamSender(
@@ -76,6 +82,7 @@ final class StreamEngine: @unchecked Sendable {
             callbacks: .init(
                 stateChanged: { [weak encoder] state in
                     connected.value.store(state == .connected, ordering: .relaxed)
+                    if state == .connected { audio?.start() } else { audio?.stop() }
                     if state == .connected { encoder?.forceKeyframe() }
                     continuation.yield(.state(state))
                 },
@@ -83,6 +90,7 @@ final class StreamEngine: @unchecked Sendable {
             ))
         link.sender.withLock { $0 = sender }
         self.encoder = encoder
+        self.audio = audio
         self.sender = sender
 
         let dev = device ?? MTLCreateSystemDefaultDevice()
@@ -120,6 +128,20 @@ final class StreamEngine: @unchecked Sendable {
 
     /// Whether anything consumes frames right now (connected, or preview on).
     var wantsFrames: Bool { isConnected || previewEnabled.load(ordering: .relaxed) }
+
+    // MARK: - Audio
+
+    /// Real-time safe: copies into the ring (short lock, no allocation) when connected.
+    /// `sample(frame, channel)` for channel 0/1.
+    func submitAudio(frames: Int, sampleRate: Double, endTime: Double, sample: (Int, Int) -> Float) {
+        guard let audio, frames > 0, sampleRate > 0, isConnected else { return }
+        audio.ring.write(frames: frames, sampleRate: sampleRate, endTime: endTime, sample: sample)
+    }
+
+    var audioEnabled: Bool { audio != nil }
+
+    /// Test hook: drain the audio ring synchronously.
+    func drainAudioNow() { audio?.drainNow() }
 
     // MARK: - Throttle
 

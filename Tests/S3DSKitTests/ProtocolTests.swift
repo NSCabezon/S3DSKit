@@ -85,6 +85,14 @@ struct AnnexBTests {
         #expect(Array(out) == [0, 0, 0, 1] + sps + [0, 0, 0, 1] + pps + [0, 0, 0, 1] + idr)
     }
 
+    @Test func countsSlices() {
+        let one = avcc([sps, pps, [0x65, 0x11, 0x22]])
+        #expect(AnnexB.sliceCount(avcc: one, nalLengthSize: 4) == 1)
+        let two = avcc([[0x41, 0x9A], [0x41, 0x9B]])
+        #expect(AnnexB.sliceCount(avcc: two, nalLengthSize: 4) == 2)
+        #expect(AnnexB.sliceCount(avcc: Data([0, 0, 0, 9]), nalLengthSize: 4) == nil)
+    }
+
     @Test func rejectsMalformed() {
         #expect(AnnexB.convert(avcc: Data([0, 0, 0, 9, 0x41]), nalLengthSize: 4) == nil)
         #expect(AnnexB.convert(avcc: Data([0, 0]), nalLengthSize: 4) == nil)

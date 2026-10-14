@@ -52,7 +52,7 @@ Pro and the 3DS must be on the same Wi-Fi.
 ```swift
 import S3DSKit
 
-let streamer = S3DSStreamer()              // defaults: alternating layout, 30 stereo fps, 2 Mbps
+let streamer = S3DSStreamer()              // hardware-proven defaults, see "Recommended settings"
 streamer.connect(host: "192.168.1.50")     // IP shown on the 3DS bottom screen; port 7777
 // UI: streamer.connectionState, streamer.stats, streamer.bitrate = 1_500_000, ...
 // optional: streamer.isPreviewEnabled = true → streamer.previewImage (800x240 SBS CGImage)
@@ -149,6 +149,62 @@ ignored. Tested in the simulator: a box renders into both eyes.
 with `eye: .left` and then `.right` for the alternating layout, or one 240x800 buffer with
 `eye: nil` for stacked. `RotationMapping` has the pixel mapping.
 
+### 5. Audio
+
+Audio goes out on the same connection as the video. The library encodes it as Opus at 48 kHz
+stereo, in 20 ms packets (960 frames) at 96 kbps by default (`audioBitrate`). Each packet is
+sent as an `AUDIO` (0x03) message: a big-endian µs timestamp followed by the Opus packet. The
+timestamp uses the same clock as the video frames (`CACurrentMediaTime`, i.e.
+`mach_absolute_time`). Audio is on by default; turn it off with
+`S3DSConfiguration(audioEnabled: false)`. Submissions are ignored while not connected.
+
+The submit calls are **real-time safe**. They only copy into a ring buffer, holding an
+`os_unfair_lock` for the copy and allocating nothing. Resampling, upmixing and encoding run on
+a background queue. Any sample rate works; mono is sent to both channels.
+
+tc-visionos: its `GameCore` audio pull produces mono Float32 at 48 kHz on the audio thread.
+Hand each rendered block to the streamer from that same callback:
+
+```swift
+// inside the audio render block, after filling `out` (frameCount mono Float32 samples):
+streamer.submitAudio(samples: UnsafeBufferPointer(start: out, count: Int(frameCount)),
+                     channels: 1, sampleRate: 48_000)
+```
+
+Other inputs: `submitAudio(_ buffer: AVAudioPCMBuffer, hostTime:)` takes Float32 or Int16
+buffers, interleaved or not (for example from an `AVAudioEngine` tap; pass `when.hostTime`).
+Interleaved stereo works with `submitAudio(samples:channels: 2, sampleRate:)`.
+
+Audio is never dropped by the video backpressure logic, only when the connection is down. Sends
+are asynchronous, so audio and video do not wait on each other.
+
+## Recommended settings / hardware notes
+
+The defaults are the settings proven on a New 3DS XL: 29.9 stereo pairs/s with 0 decode errors.
+See [`docs/ARCHITECTURE.md` › Hardware findings](../docs/ARCHITECTURE.md#hardware-findings-new-3ds-xl-2026-10-14).
+
+| Setting | Default | Notes |
+|---|---|---|
+| `layout` | `.alternating240x400` | The 3DS MVD decoder crashes on 240x800. |
+| `framesPerSecond` | 30 stereo pairs | 60 encoded fps (L, R, L, R…). |
+| `bitrate` | 1.5 Mbps | Clamped to 0.5–3 Mbps. Above ~2 Mbps risks stalls over the 3DS's Wi-Fi (2.5 Mbps stalled). |
+| `keyframeInterval` | 30 pairs | An IDR every 60 encoded frames (1 s), always on a **left** frame, with SPS+PPS before each IDR. |
+| `maxInFlightFrames` | 6 pairs | At most 12 AUs (200 ms) of video ahead. Beyond that, non-key frames are dropped and an IDR is forced on the next left frame. |
+| `audioBitrate` | 96 kbps | Opus, 48 kHz stereo, 20 ms. |
+
+The library always enforces the following:
+
+- **Exactly one slice per picture.** The MVD decoder corrupts and then crashes on
+  multi-slice frames. VideoToolbox's software H.264 encoder (used in the simulator) emits 2–5
+  slices by default. S3DSKit sets the session property `NumberOfSlices = 1`, which
+  `VTSessionCopySupportedPropertyDictionary` lists but has no public constant, and never sets
+  `MaxH264SliceBytes`.
+  - It also checks every picture. A multi-slice picture triggers `assertionFailure` in DEBUG.
+  - In release, the picture is logged (`log.fault`) and dropped, and an IDR is requested.
+- H.264 Baseline, no B-frames (`AllowFrameReordering = false`), no AUD or SEI NALs.
+- A `VIDEO_AU` payload may be at most 256 KiB, the receiver's limit. A larger AU is dropped and an
+  IDR is forced on the next left frame. An `AUDIO` payload may be at most 4 KiB.
+
 ## Threading notes
 
 - `S3DSStreamer` state (`connectionState`, `stats`, `previewImage`, `bitrate`, `frameOptions`)
@@ -157,8 +213,8 @@ with `eye: .left` and then `.right` for the alternating layout, or one 240x800 b
 - `StereoEyeRenderer.render` must be called from one thread at a time. `S3DSRealityCapture` is
   main-actor.
 - At most 3 stereo frames are in flight on the GPU. If the network backs up (more than
-  `maxInFlightFrames` stereo frames unacknowledged), non-key frames are dropped and a new left
-  IDR is forced once the backlog drains.
+  `maxInFlightFrames` stereo frames, 12 AUs by default, unsent), non-key frames are dropped and
+  a new left IDR is forced once the backlog drains. Audio is exempt.
 - `connect` does not retry on its own. On failure `connectionState` is `.failed(reason)`. Call
   `connect` again, for example from a button.
 
@@ -172,11 +228,15 @@ xcodebuild test  -scheme S3DSKit -destination 'platform=visionOS Simulator,name=
 
 `swift test` cannot run visionOS tests, so use `xcodebuild`. The suite covers:
 
-- protocol framing, AVCC→Annex-B, mapping, fit and letterbox math, camera math;
+- protocol framing, AVCC→Annex-B, slice counting, mapping, fit and letterbox math, camera math,
+  and the hardware defaults;
 - GPU kernel exactness, pixel by pixel, for both layouts;
 - encoder keyframe placement (IDR only on left frames, deferred requests);
-- end-to-end loopback streaming to a fake 3DS, for alternating, stacked, mono 1920x1440 at
-  90 Hz (throttle) and preview;
+- Opus at 50 packets/s with 20 ms timestamps, from 48 kHz and from 44.1 kHz input, decoded back
+  to a 440 Hz sine; the audio ring buffer;
+- end-to-end loopback streaming to a fake 3DS, for alternating (with interleaved audio, decoded
+  back to 440 Hz, and one slice per AU), stacked, mono 1920x1440 at 90 Hz (throttle) and
+  preview;
 - the RealityKit adapter.
 
 The end-to-end tests write what they received to the simulator's temp dir and print

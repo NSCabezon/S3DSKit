@@ -47,4 +47,24 @@ enum AnnexB {
             return out
         }
     }
+
+    /// Number of coded slice NAL units (types 1 and 5) in an AVCC access unit, or nil if malformed.
+    /// The 3DS MVD decoder requires exactly one per picture.
+    static func sliceCount(avcc: Data, nalLengthSize: Int) -> Int? {
+        guard [1, 2, 4].contains(nalLengthSize) else { return nil }
+        return avcc.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int? in
+            var i = 0, count = 0
+            while i < raw.count {
+                guard i + nalLengthSize <= raw.count else { return nil }
+                var len = 0
+                for k in 0..<nalLengthSize { len = (len << 8) | Int(raw[i + k]) }
+                i += nalLengthSize
+                guard len > 0, i + len <= raw.count else { return nil }
+                let type = raw[i] & 0x1F
+                if type == 1 || type == 5 { count += 1 }
+                i += len
+            }
+            return count
+        }
+    }
 }

@@ -18,8 +18,14 @@ public enum S3DSLayout: Sendable, Equatable {
 public struct S3DSConfiguration: Sendable, Equatable {
     /// Stream layout (must match what the receiver expects).
     public var layout: S3DSLayout
-    /// Average H.264 bitrate in bits per second.
-    public var bitrate: Int
+    /// Average H.264 bitrate in bits per second, clamped to ``bitrateRange``. 1.5 Mbps is clean
+    /// over the 3DS's Wi-Fi; above ~2 Mbps risks stalls (2.5 Mbps stalled on hardware).
+    public var bitrate: Int {
+        didSet { bitrate = Self.clampBitrate(bitrate) }
+    }
+    /// Allowed video bitrate range (0.5–3 Mbps).
+    public static let bitrateRange = 500_000...3_000_000
+    static func clampBitrate(_ b: Int) -> Int { min(max(b, bitrateRange.lowerBound), bitrateRange.upperBound) }
     /// Target stereo frame rate (pairs per second). With `.alternating240x400` the encoder runs
     /// at twice this rate. Submissions arriving faster are dropped by the built-in throttle.
     public var framesPerSecond: Int
@@ -27,25 +33,35 @@ public struct S3DSConfiguration: Sendable, Equatable {
     public var keyframeInterval: Int
     /// Name sent in the HELLO message (≤ 64 UTF-8 bytes).
     public var senderName: String
-    /// Unacknowledged network sends tolerated before non-key frames are dropped.
+    /// Stereo frames allowed in flight to the network (send not yet completed) before non-key
+    /// frames are dropped and an IDR is forced on the next left frame. Default 6 = 12 AUs = 200 ms
+    /// at 60 fps in the alternating layout (the receiver's burst budget).
     public var maxInFlightFrames: Int
     /// How source images are fitted, eye swapping, flipping.
     public var frameOptions: S3DSFrameOptions
+    /// Stream audio submitted with `submitAudio` (Opus, 48 kHz stereo, 20 ms packets).
+    public var audioEnabled: Bool
+    /// Opus bitrate in bits per second.
+    public var audioBitrate: Int
 
     public init(layout: S3DSLayout = .alternating240x400,
-                bitrate: Int = 2_000_000,
+                bitrate: Int = 1_500_000,
                 framesPerSecond: Int = 30,
                 keyframeInterval: Int = 30,
                 senderName: String = "S3DSKit",
-                maxInFlightFrames: Int = 3,
-                frameOptions: S3DSFrameOptions = S3DSFrameOptions()) {
+                maxInFlightFrames: Int = 6,
+                frameOptions: S3DSFrameOptions = S3DSFrameOptions(),
+                audioEnabled: Bool = true,
+                audioBitrate: Int = 96_000) {
         self.layout = layout
-        self.bitrate = bitrate
+        self.bitrate = Self.clampBitrate(bitrate)
         self.framesPerSecond = max(1, framesPerSecond)
         self.keyframeInterval = max(1, keyframeInterval)
         self.senderName = senderName
         self.maxInFlightFrames = max(1, maxInFlightFrames)
         self.frameOptions = frameOptions
+        self.audioEnabled = audioEnabled
+        self.audioBitrate = audioBitrate
     }
 }
 
@@ -69,7 +85,7 @@ public struct S3DSFrameOptions: Sendable, Equatable {
 public struct S3DSStats: Sendable, Equatable {
     /// Video frames handed to the network per second.
     public var framesPerSecond: Double = 0
-    /// Network throughput in kilobits per second (including headers).
+    /// Network throughput in kilobits per second (video + audio, including headers).
     public var kilobitsPerSecond: Double = 0
     /// Total frames sent since the streamer was created.
     public var framesSent: Int = 0
@@ -77,6 +93,8 @@ public struct S3DSStats: Sendable, Equatable {
     public var framesDropped: Int = 0
     /// Total keyframes sent.
     public var keyframesSent: Int = 0
+    /// Total Opus audio packets sent (50 per second while audio flows).
+    public var audioPacketsSent: Int = 0
 
     public init() {}
 }

@@ -11,8 +11,10 @@ public enum S3DSProtocol {
     public static let headerLength = 12
     /// Magic bytes `"S3DS"`.
     public static let magic: [UInt8] = [0x53, 0x33, 0x44, 0x53]
-    /// Largest payload the receiver accepts (512 KiB).
-    public static let maxPayloadLength = 512 * 1024
+    /// Largest message payload the 3DS receiver accepts (256 KiB; bigger closes the connection).
+    public static let maxPayloadLength = 256 * 1024
+    /// Largest `AUDIO` payload (timestamp + Opus packet) the receiver accepts.
+    public static let maxAudioPayloadLength = 4 * 1024
     /// `VIDEO_AU` flag bit 0: the access unit contains an IDR (keyframe).
     public static let keyframeFlag: UInt8 = 0x01
     /// `VIDEO_AU` flag bit 1 (alternating layout): 0 = left eye, 1 = right eye.
@@ -36,6 +38,8 @@ public enum S3DSProtocol {
         case videoAU = 0x01
         /// sender → 3DS: UTF-8 sender name (≤ 64 bytes).
         case hello = 0x02
+        /// sender → 3DS: u64 BE timestamp (µs) + one Opus packet (48 kHz stereo, 20 ms).
+        case audio = 0x03
         /// 3DS → sender: please send a keyframe next.
         case keyframeRequest = 0x10
     }
@@ -96,6 +100,14 @@ public enum S3DSProtocol {
         var d = Header(type: type, flags: flags, length: UInt32(payload.count)).encoded()
         d.append(payload)
         return d
+    }
+
+    /// An `AUDIO` message: big-endian µs timestamp followed by the Opus packet.
+    public static func audio(timestampMicros: UInt64, opusPacket: Data) -> Data {
+        var payload = Data(capacity: 8 + opusPacket.count)
+        withUnsafeBytes(of: timestampMicros.bigEndian) { payload.append(contentsOf: $0) }
+        payload.append(opusPacket)
+        return message(.audio, payload: payload)
     }
 
     /// A `HELLO` message carrying `name` truncated to 64 UTF-8 bytes.

@@ -26,6 +26,7 @@ struct SenderCounters: Sendable {
     var bytesSent = 0
     var framesDropped = 0
     var keyframesSent = 0
+    var audioPacketsSent = 0
 }
 
 /// TCP client to the 3DS receiver (Network.framework).
@@ -130,6 +131,30 @@ final class StreamSender: @unchecked Sendable {
             let gen = generation
             conn.send(content: message, completion: .contentProcessed { [weak self] error in
                 self?.sendCompleted(error: error, bytes: message.count, keyframe: isKeyframe, generation: gen)
+            })
+        }
+    }
+
+    /// Queues one Opus packet. Audio bypasses video backpressure (it is tiny) and is dropped
+    /// only when there is no live connection. Sends are asynchronous, so audio never waits on
+    /// video or vice versa (both share the TCP stream in submission order).
+    func sendAudio(_ opusPacket: Data, timestampMicros: UInt64) {
+        queue.async { [self] in
+            guard connected, let conn = connection else { return }
+            guard 8 + opusPacket.count <= S3DSProtocol.maxAudioPayloadLength else {
+                Self.log.error("Opus packet too large (\(opusPacket.count) B), dropped")
+                return
+            }
+            let message = S3DSProtocol.audio(timestampMicros: timestampMicros, opusPacket: opusPacket)
+            let gen = generation
+            conn.send(content: message, completion: .contentProcessed { [weak self] error in
+                guard let self, gen == self.generation else { return }
+                if let error {
+                    self.fail("send: \(error.localizedDescription)")
+                    return
+                }
+                self.counters.audioPacketsSent += 1
+                self.counters.bytesSent += message.count
             })
         }
     }

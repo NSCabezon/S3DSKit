@@ -1,3 +1,4 @@
+import AVFAudio
 import CoreGraphics
 import CoreVideo
 import Foundation
@@ -37,12 +38,13 @@ public final class S3DSStreamer {
     /// True while connected to a receiver (frames are being encoded and sent).
     public var isStreaming: Bool { connectionState == .connected }
 
-    /// Average bitrate in bits per second; applies to the running encoder immediately.
+    /// Average bitrate in bits per second (clamped to `S3DSConfiguration.bitrateRange`); applies
+    /// to the running encoder immediately. Above ~2 Mbps risks stalls on the 3DS's Wi-Fi.
     public var bitrate: Int {
         get { configuration.bitrate }
         set {
             configuration.bitrate = newValue
-            engine.setBitrate(newValue)
+            engine.setBitrate(configuration.bitrate)
         }
     }
 
@@ -161,6 +163,59 @@ public final class S3DSStreamer {
         engine.submit(pixelBuffer: pixelBuffer, eye: eye, throttled: throttle)
     }
 
+    // MARK: - Audio input (real-time safe)
+
+    /// Submits interleaved Float32 audio. Safe to call from a real-time audio thread: it only
+    /// copies into a ring buffer (no allocation, a lock held for the copy) and returns. Resampling
+    /// to 48 kHz stereo and Opus encoding run on a background queue. Audio is discarded while not
+    /// connected or when `configuration.audioEnabled` is false.
+    ///
+    /// - Parameters:
+    ///   - samples: `frames * channels` interleaved samples.
+    ///   - channels: 1 (mono, sent to both channels), 2 (stereo); more uses the first two.
+    ///   - sampleRate: any rate (resampled to 48 kHz).
+    ///   - hostTime: capture time of the first sample (`mach_absolute_time` ticks, as in
+    ///     `AVAudioTime.hostTime`); nil = the samples end now.
+    public nonisolated func submitAudio(samples: UnsafeBufferPointer<Float>, channels: Int,
+                                        sampleRate: Double, hostTime: UInt64? = nil) {
+        guard channels > 0, let base = samples.baseAddress else { return }
+        let frames = samples.count / channels
+        let right = min(1, channels - 1)
+        engine.submitAudio(frames: frames, sampleRate: sampleRate,
+                           endTime: Self.endTime(hostTime: hostTime, frames: frames, sampleRate: sampleRate)) { f, ch in
+            base[f * channels + (ch == 0 ? 0 : right)]
+        }
+    }
+
+    /// Submits an `AVAudioPCMBuffer` (Float32 or Int16, interleaved or not, any rate). Real-time
+    /// safe like ``submitAudio(samples:channels:sampleRate:hostTime:)``.
+    public nonisolated func submitAudio(_ buffer: AVAudioPCMBuffer, hostTime: UInt64? = nil) {
+        let format = buffer.format
+        let channels = Int(format.channelCount)
+        let frames = Int(buffer.frameLength)
+        guard channels > 0, frames > 0 else { return }
+        let rate = format.sampleRate
+        let end = Self.endTime(hostTime: hostTime, frames: frames, sampleRate: rate)
+        let right = min(1, channels - 1)
+        let interleaved = format.isInterleaved
+        if let data = buffer.floatChannelData {
+            engine.submitAudio(frames: frames, sampleRate: rate, endTime: end) { f, ch in
+                let c = ch == 0 ? 0 : right
+                return interleaved ? data[0][f * channels + c] : data[c][f]
+            }
+        } else if let data = buffer.int16ChannelData {
+            engine.submitAudio(frames: frames, sampleRate: rate, endTime: end) { f, ch in
+                let c = ch == 0 ? 0 : right
+                return Float(interleaved ? data[0][f * channels + c] : data[c][f]) / 32768
+            }
+        }
+    }
+
+    private nonisolated static func endTime(hostTime: UInt64?, frames: Int, sampleRate: Double) -> Double {
+        guard let hostTime else { return CACurrentMediaTime() }
+        return AVAudioTime.seconds(forHostTime: hostTime) + Double(frames) / sampleRate
+    }
+
     // MARK: - Private
 
     private func handle(_ event: StreamEngine.Event) {
@@ -182,6 +237,7 @@ public final class S3DSStreamer {
         s.framesSent = c.framesSent
         s.framesDropped = c.framesDropped
         s.keyframesSent = c.keyframesSent
+        s.audioPacketsSent = c.audioPacketsSent
         stats = s
         lastCounters = c
         lastCountersTime = now
