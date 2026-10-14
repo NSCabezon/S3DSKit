@@ -17,13 +17,13 @@ Stream stereoscopic 3D content rendered by a visionOS app (Apple Vision Pro) to 
  └──────────────────────────────────────────────┘         └──────────────────────────────────┘
 ```
 
-Repo layout:
+Components:
 
-| Dir | What |
+| Where | What |
 |---|---|
-| `3ds/` | 3DS receiver (C, libctru, devkitARM). Output `3DSStream.3dsx`. |
-| `visionos/` | visionOS sender app (Swift 6, SwiftUI, Metal, Compositor Services, VideoToolbox). XcodeGen project. |
-| `tools/` | Mac test tools (Python 3 stdlib + ffmpeg): test sender and fake 3DS receiver. |
+| `3ds/` (this repo) | 3DS receiver (C, libctru, devkitARM). Outputs `3DSStream.cia` / `.3dsx`. |
+| `tools/` (this repo) | Mac tools (Python 3 stdlib + ffmpeg): test sender, fake 3DS receiver, CIA QR server, spatial-video converter. |
+| [S3DSKit](https://github.com/NSCabezon/S3DSKit) (separate repo) | visionOS sender library (Swift 6, Metal, VideoToolbox, Opus). Ships a copy of this file as `docs/PROTOCOL.md`; this file is the source of truth. |
 
 ## Video format (the contract)
 
