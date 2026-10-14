@@ -7,7 +7,13 @@ import QuartzCore
 import Synchronization
 import os
 
-/// The thread-safe core behind ``S3DSStreamer``: throttle → rotate/stack (GPU) → H.264 → TCP.
+/// The thread-safe core behind ``S3DSStreamer``: throttle → congestion gate → rotate/stack (GPU)
+/// → H.264 → TCP.
+///
+/// Congestion is handled per stereo pair, before any work: when a pair is due but the oldest
+/// unsent video AU is older than `CongestionPolicy.skipLatency`, the pair is skipped (never
+/// rotated nor encoded), so the H.264 reference chain stays intact. Skips also drive the
+/// adaptive bitrate (`CongestionController`).
 ///
 /// Every mutable field lives in a `Mutex`/`Atomic`; the Metal/VT objects are immutable references
 /// whose APIs are thread-safe, hence `@unchecked Sendable`.
@@ -48,6 +54,12 @@ final class StreamEngine: @unchecked Sendable {
     private let connected = Flag()
     private let throttle: Mutex<Throttle>
     private let audioFramesSubmitted = Atomic<Int>(0)
+    private let congestion: Mutex<CongestionController>
+    /// Opus bitrate when audio is on (0 otherwise); part of the rate the backlog drains at.
+    private let audioBitrate: Int
+    private let congestionSkips = Atomic<Int>(0)
+    /// Alternating pixel-buffer input: the last left frame was accepted, so its right may follow.
+    private let rightExpected = Atomic<Bool>(false)
     private let options: Mutex<S3DSFrameOptions>
     private let previewEnabled = Atomic<Bool>(false)
     private let lastPreview = Mutex<Double>(-.infinity)
@@ -59,6 +71,7 @@ final class StreamEngine: @unchecked Sendable {
         var encoded: Int
         var latencySum: Double
         var multiSlice: Int
+        var skipped: Int
     }
     private let lastSummary = Mutex<SummarySnapshot?>(nil)
     private static let log = Logger(subsystem: "S3DSKit", category: "engine")
@@ -71,6 +84,9 @@ final class StreamEngine: @unchecked Sendable {
         throttle = Mutex(Throttle(limiter: FrameThrottle(framesPerSecond: configuration.framesPerSecond)))
         layout = configuration.layout
         options = Mutex(configuration.frameOptions)
+        var policy = configuration.congestion
+        policy.adaptiveBitrate = configuration.adaptiveBitrate
+        congestion = Mutex(CongestionController(policy: policy, bitrate: configuration.bitrate))
         (events, continuation) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .bufferingNewest(16))
 
         let link = SenderLink()
@@ -91,6 +107,7 @@ final class StreamEngine: @unchecked Sendable {
         let sender = StreamSender(
             senderName: configuration.senderName,
             maxInFlightFrames: configuration.maxInFlightFrames * configuration.layout.framesPerPair,
+            policy: policy,
             callbacks: .init(
                 stateChanged: { [weak encoder] state in
                     connected.value.store(state == .connected, ordering: .relaxed)
@@ -101,6 +118,8 @@ final class StreamEngine: @unchecked Sendable {
                 keyframeNeeded: { [weak encoder] in encoder?.forceKeyframe() }
             ))
         link.sender.withLock { $0 = sender }
+        audioBitrate = configuration.audioEnabled ? configuration.audioBitrate : 0
+        sender.setDrainRate(configuration.bitrate + audioBitrate)
         self.encoder = encoder
         self.audio = audio
         self.sender = sender
@@ -130,7 +149,17 @@ final class StreamEngine: @unchecked Sendable {
 
     func connect(host: String, port: UInt16) { sender.connect(host: host, port: port) }
     func disconnect() { sender.disconnect() }
-    func setBitrate(_ bitrate: Int) { encoder.setBitrate(bitrate) }
+    func setBitrate(_ bitrate: Int) {
+        congestion.withLock { $0.setTarget(bitrate) }
+        encoder.setBitrate(bitrate)
+        sender.setDrainRate(bitrate + audioBitrate)
+    }
+    /// Starts the bitrate adaptation at `bitrate` (clamped to the floor and the ceiling).
+    func setStartBitrate(_ bitrate: Int) {
+        let rate = congestion.withLock { c -> Int in c.setStart(bitrate); return c.bitrate }
+        encoder.setBitrate(rate)
+        sender.setDrainRate(rate + audioBitrate)
+    }
     func setFrameOptions(_ o: S3DSFrameOptions) { options.withLock { $0 = o } }
     func setPreviewEnabled(_ on: Bool) { previewEnabled.store(on, ordering: .relaxed) }
     func forceKeyframe() { encoder.forceKeyframe() }
@@ -160,8 +189,21 @@ final class StreamEngine: @unchecked Sendable {
                    audioFramesSubmitted: audioFramesSubmitted.load(ordering: .relaxed),
                    audioFramesDropped: audio?.ring.droppedFrames ?? 0,
                    encoderIsHardware: encoder.isHardware,
-                   multiSlicePicturesDropped: encoder.multiSlicePicturesDropped)
+                   multiSlicePicturesDropped: encoder.multiSlicePicturesDropped,
+                   congestionPairsSkipped: congestionSkips.load(ordering: .relaxed),
+                   videoBitrate: videoBitrate)
     }
+
+    /// The bitrate the encoder runs at (configured, or lowered by the adaptation).
+    var videoBitrate: Int { congestion.withLock { $0.bitrate } }
+    /// Stereo pairs skipped before encoding because of congestion (monotonic).
+    var congestionPairsSkipped: Int { congestionSkips.load(ordering: .relaxed) }
+    /// Test hooks.
+    var encoderCounters: (submitted: Int, encoded: Int, latencySum: Double) { encoder.encodeCounters }
+    var encoderKeyframeTimes: [Double] { encoder.keyframeTimes }
+    /// Estimated seconds of data queued ahead of a new pair (what the skip decision uses).
+    var videoBacklog: Double { sender.backlogSeconds() }
+    var socketBacklog: Int { sender.socketBacklog }
 
     /// Logs (info) a one-line sender summary, plus a drop-reason line when anything was dropped
     /// since the last call. Call about once per second; calls closer than 0.9 s are ignored.
@@ -169,33 +211,38 @@ final class StreamEngine: @unchecked Sendable {
         let c = counters
         let e = encoder.encodeCounters
         let multi = encoder.multiSlicePicturesDropped
+        let skipped = congestionPairsSkipped
         let snap = SummarySnapshot(time: now, sender: c, submitted: e.submitted, encoded: e.encoded,
-                                   latencySum: e.latencySum, multiSlice: multi)
+                                   latencySum: e.latencySum, multiSlice: multi, skipped: skipped)
         let previous: SummarySnapshot? = lastSummary.withLock { last in
             if let l = last, now - l.time < 0.9 { return nil }
             defer { last = snap }
             return last ?? SummarySnapshot(time: now - 1, sender: SenderCounters(), submitted: 0, encoded: 0,
-                                           latencySum: 0, multiSlice: 0)
+                                           latencySum: 0, multiSlice: 0, skipped: 0)
         }
         guard let p = previous, isConnected else { return }
         let dt = max(0.001, now - p.time)
         let encoded = e.encoded - p.encoded
         let latencyMs = encoded > 0 ? (e.latencySum - p.latencySum) / Double(encoded) * 1000 : 0
         let hw = encoder.isHardware.map { $0 ? "hw" : "sw" } ?? "?"
+        let skips = skipped - p.skipped
         Self.log.info("""
             video/s: submitted \(e.submitted - p.submitted) encoded \(encoded) sent \(c.framesSent - p.sender.framesSent) \
-            keys \(c.keyframesSent - p.sender.keyframesSent) dropped \(c.framesDropped - p.sender.framesDropped); \
-            \(Int(Double(c.bytesSent - p.sender.bytesSent) * 8 / 1000 / dt)) kbps; in-flight \(c.inFlight); \
-            encode \(String(format: "%.1f", latencyMs)) ms avg (\(hw))
+            keys \(c.keyframesSent - p.sender.keyframesSent) dropped \(c.framesDropped - p.sender.framesDropped) \
+            pairs-skipped \(skips); \(Int(Double(c.bytesSent - p.sender.bytesSent) * 8 / 1000 / dt)) kbps \
+            (bitrate \(self.videoBitrate / 1000) kbps); in-flight \(c.inFlight) \
+            backlog \(Int(self.videoBacklog * 1000)) ms (socket \(self.socketBacklog / 1024) KiB); encode \(String(format: "%.1f", latencyMs)) ms avg (\(hw))
             """)
         let bp = c.backpressureDropped - p.sender.backpressureDropped
         let gate = c.awaitingKeyframeDropped - p.sender.awaitingKeyframeDropped
         let big = c.oversizeDropped - p.sender.oversizeDropped
         let ms = multi - p.multiSlice
-        if bp + gate + big + ms > 0 {
+        if bp + gate + big + ms + skips > 0 {
             Self.log.info("""
-                drops/s: backpressure \(bp) awaiting-keyframe \(gate) oversize \(big) multi-slice \(ms) \
-                (totals \(c.backpressureDropped)/\(c.awaitingKeyframeDropped)/\(c.oversizeDropped)/\(multi))
+                drops/s: congestion-skipped pairs \(skips) backpressure \(bp) awaiting-keyframe \(gate) \
+                oversize \(big) multi-slice \(ms) (totals \(skipped)/\(c.backpressureDropped)/\
+                \(c.awaitingKeyframeDropped)/\(c.oversizeDropped)/\(multi); recovery IDRs \
+                \(c.recoveryKeyframesRequested))
                 """)
         }
     }
@@ -205,13 +252,42 @@ final class StreamEngine: @unchecked Sendable {
 
     // MARK: - Throttle
 
-    /// Reserves a capture slot if one is due at `now` (seconds, CACurrentMediaTime clock).
+    /// Reserves a capture slot if one is due at `now` (seconds, CACurrentMediaTime clock) and the
+    /// link is not congested. A due slot refused for congestion still consumes the throttle's
+    /// cadence: that pair is skipped, not delayed.
     func reserveCapture(at now: Double) -> Bool {
         guard wantsFrames else { return false }
-        return throttle.withLock { t in
+        let due = throttle.withLock { t in
             guard t.inFlight < Self.maxGPUFramesInFlight else { return false }
             return t.limiter.accept(at: now)
         }
+        return due && congestionAllowsPair()
+    }
+
+    // MARK: - Congestion
+
+    /// Congestion gate for a new stereo pair (call once per pair, before any work on it). Records
+    /// a skip when it refuses.
+    private func congestionAllowsPair() -> Bool {
+        guard isConnected else { return true }
+        let backlog = sender.backlogSeconds()
+        guard congestion.withLock({ $0.shouldSkip(backlog: backlog) }) else { return true }
+        congestionSkips.add(1, ordering: .relaxed)
+        recordPair(skipped: true, backlog: backlog)
+        return false
+    }
+
+    /// Feeds one due pair (sent on, or skipped) and the backlog it saw to the bitrate adaptation.
+    private func recordPair(skipped: Bool, backlog: Double? = nil) {
+        let now = CACurrentMediaTime()
+        let seen = backlog ?? sender.backlogSeconds()
+        guard let (old, rate) = congestion.withLock({ c -> (Int, Int)? in
+            let old = c.bitrate
+            return c.record(at: now, skipped: skipped, backlog: seen).map { (old, $0) }
+        }) else { return }
+        encoder.setBitrate(rate)
+        sender.setDrainRate(rate + audioBitrate)
+        Self.log.info("adaptive bitrate: \(rate / 1000) kbps (\(rate < old ? "congested" : "link clear"))")
     }
 
     // MARK: - Frame input
@@ -222,8 +298,8 @@ final class StreamEngine: @unchecked Sendable {
         guard let rotator else { return false }
         if throttled {
             guard reserveCapture(at: now) else { return false }
-        } else if !wantsFrames {
-            return false
+        } else {
+            guard wantsFrames, congestionAllowsPair() else { return false }
         }
         let opts = options.withLock { $0 }
         var l = left, r = right ?? left
@@ -237,6 +313,7 @@ final class StreamEngine: @unchecked Sendable {
             return false
         }
         throttle.withLock { $0.inFlight += 1 }
+        if isConnected { recordPair(skipped: false) }
         let box = UncheckedBox(buffers)
         cb.addCompletedHandler { [weak self] buffer in
             guard let self else { return }
@@ -260,11 +337,16 @@ final class StreamEngine: @unchecked Sendable {
             Self.log.error("submit(pixelBuffer:): wrong size or missing eye for layout \(String(describing: self.layout))")
             return false
         }
-        // In the alternating layout only left frames are throttled; the right one follows.
-        if throttled, eye != .right {
-            guard reserveCapture(at: now) else { return false }
-        } else if !wantsFrames {
-            return false
+        // In the alternating layout the pair is decided on its left frame (throttle, congestion);
+        // a right frame is accepted only right after an accepted left, so a skipped pair can
+        // never leave a lone right frame.
+        if alternating, eye == .right {
+            guard rightExpected.exchange(false, ordering: .acquiringAndReleasing), wantsFrames else { return false }
+        } else {
+            let accepted = throttled ? reserveCapture(at: now) : (wantsFrames && congestionAllowsPair())
+            if alternating { rightExpected.store(accepted, ordering: .releasing) }
+            guard accepted else { return false }
+            if isConnected { recordPair(skipped: false) }
         }
         if alternating {
             encodeIfConnected(pixelBuffer, eye: eye, hostTime: now)

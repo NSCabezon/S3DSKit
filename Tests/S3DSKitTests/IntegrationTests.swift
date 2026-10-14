@@ -62,7 +62,7 @@ struct IntegrationTests {
                 #expect(r.maxNumReorderFrames == 0 && r.maxDecFrameBuffering >= max(1, sps.maxNumRefFrames))
             }
         }
-        #expect(aus.filter { $0.header.flags & 1 != 0 }.count >= 2)   // keyframe interval ≤ 1 s
+        #expect(aus.filter { $0.header.flags & 1 != 0 }.count >= 2)   // connect IDR + KEYFRAME_REQ/2 s cadence
 
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(name).h264")
         try aus.reduce(into: Data()) { $0.append($1.payload) }.write(to: url)
@@ -146,7 +146,7 @@ struct IntegrationTests {
     }
 
     /// Mono 1920x1440 rgba8Unorm "game frame" submitted at ~90 Hz with right: nil and no command
-    /// buffer (library queue); the throttle must pass 30 stereo frames per second, not more.
+    /// buffer (library queue); the throttle must pass the configured stereo rate (20/s), not more.
     @Test func monoLargeTextureThrottled() async throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let queue = try #require(device.makeCommandQueue())
@@ -167,11 +167,12 @@ struct IntegrationTests {
             }
             elapsed = CACurrentMediaTime() - start
         }
-        // The first call is accepted at t = 0, then one per 1/30 s.
+        // The first call is accepted at t = 0, then one per 1/fps s.
+        let fps = Double(S3DSConfiguration().framesPerSecond)
         let rate = Double(accepted - 1) / elapsed
         print("S3DSKIT_THROTTLE calls=\(calls) accepted=\(accepted) elapsed=\(elapsed) rate=\(rate)/s")
-        #expect(Double(calls) / elapsed >= 50, "test loop too slow to exercise the throttle")
-        #expect(rate >= 28 && rate <= 30.5, "accepted \(rate)/s, want 30")
+        #expect(Double(calls) / elapsed >= 2.5 * fps, "test loop too slow to exercise the throttle")
+        #expect(rate >= fps - 2 && rate <= fps + 0.5, "accepted \(rate)/s, want \(fps)")
         #expect(aus.count >= 2 * accepted - 4)    // two AUs per accepted frame (tail may be cut)
     }
 

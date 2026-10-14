@@ -114,19 +114,31 @@ struct PixelReader {
 }
 
 /// A fake 3DS: BSD-socket TCP server on 127.0.0.1 with an ephemeral port. Sends KEYFRAME_REQ on
-/// accept (like the real receiver) and records every byte received.
+/// accept (like the real receiver) and records every byte received. `readBytesPerSecond` (0 =
+/// unlimited, changeable at any time) makes it a slow reader, like a 3DS on a weak Wi-Fi link;
+/// pair it with a small `receiveBuffer` so the backlog reaches the sender quickly.
 final class TestReceiver: @unchecked Sendable {
     let port: UInt16
     private let listenFD: Int32
     private let lock = NSLock()
     private var buffer = Data()
     private var finished = false
+    private var rateLimit = 0
 
-    init() throws {
+    var readBytesPerSecond: Int {
+        get { lock.lock(); defer { lock.unlock() }; return rateLimit }
+        set { lock.lock(); rateLimit = newValue; lock.unlock() }
+    }
+
+    init(readBytesPerSecond: Int = 0, receiveBuffer: Int32? = nil) throws {
+        rateLimit = readBytesPerSecond
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         try #require(fd >= 0)
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        if var size = receiveBuffer {   // inherited by the accepted socket
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+        }
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -154,10 +166,14 @@ final class TestReceiver: @unchecked Sendable {
         let req = Array(S3DSProtocol.message(.keyframeRequest))
         _ = req.withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
         var chunk = [UInt8](repeating: 0, count: 65536)
+        let tick = 0.01
         while true {
-            let n = chunk.withUnsafeMutableBytes { read(client, $0.baseAddress, $0.count) }
+            let limit = readBytesPerSecond
+            let want = limit > 0 ? max(1, Int(Double(limit) * tick)) : chunk.count
+            let n = chunk.withUnsafeMutableBytes { read(client, $0.baseAddress, min(want, $0.count)) }
             if n <= 0 { break }
             lock.lock(); buffer.append(contentsOf: chunk[0..<n]); lock.unlock()
+            if limit > 0 { Thread.sleep(forTimeInterval: tick * Double(n) / Double(want)) }
         }
         close(client)
         markFinished()

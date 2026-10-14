@@ -39,13 +39,24 @@ public final class S3DSStreamer {
     public var isStreaming: Bool { connectionState == .connected }
 
     /// Average bitrate in bits per second (clamped to `S3DSConfiguration.bitrateRange`); applies
-    /// to the running encoder immediately. Above ~2 Mbps risks stalls on the 3DS's Wi-Fi.
+    /// to the running encoder immediately. Above ~2 Mbps risks stalls on the 3DS's Wi-Fi. With
+    /// `adaptiveBitrate` it is the ceiling: the encoder may run lower on a congested link
+    /// (`stats.videoBitrate`); setting it restarts the adaptation from the new value.
     public var bitrate: Int {
         get { configuration.bitrate }
         set {
             configuration.bitrate = newValue
             engine.setBitrate(configuration.bitrate)
         }
+    }
+
+    /// With `adaptiveBitrate`: start the adaptation at `bitrate` instead of the ceiling (`bitrate`
+    /// property), e.g. the `stats.videoBitrate` that last worked with this receiver, so a new
+    /// connection does not spend its first seconds congested while it steps down. Clamped to the
+    /// floor and the ceiling; held for a few seconds before stepping up. Call it after setting the
+    /// ceiling (setting `bitrate` restarts from the ceiling).
+    public func setStartBitrate(_ bitrate: Int) {
+        engine.setStartBitrate(bitrate)
     }
 
     /// Fit / swap / flip options for texture input; applies from the next frame.
@@ -116,7 +127,8 @@ public final class S3DSStreamer {
     /// Whether a frame is due at `time` (seconds on the `CACurrentMediaTime()` clock), reserving
     /// the slot if so. Use it to skip rendering eye images that would be dropped, then submit
     /// with `throttle: false`. Returns false while nothing consumes frames (not connected and
-    /// preview off) or the GPU is behind.
+    /// preview off), the GPU is behind, or the link is congested (the pair is skipped before any
+    /// work: `stats.congestionPairsSkipped`).
     public nonisolated func nextCaptureDue(at time: CFTimeInterval = CACurrentMediaTime()) -> Bool {
         engine.reserveCapture(at: time)
     }
@@ -136,7 +148,7 @@ public final class S3DSStreamer {
     ///   - throttle: apply the frame-rate throttle (default). Pass false if you already called
     ///     ``nextCaptureDue(at:)``.
     /// - Returns: true if the frame was accepted, false if it was skipped (not due, nothing to send
-    ///   to, GPU busy, or Metal unavailable).
+    ///   to, GPU busy, link congested, or Metal unavailable).
     @discardableResult
     public nonisolated func submit(left: any MTLTexture, right: (any MTLTexture)? = nil,
                                    commandBuffer: (any MTLCommandBuffer)? = nil,
@@ -155,8 +167,10 @@ public final class S3DSStreamer {
     /// buffer holding sRGB-encoded color (IOSurface-backed recommended), see `docs/ARCHITECTURE.md`.
     ///
     /// - `.stacked240x800`: one 240x800 buffer per stereo frame, `eye` nil.
-    /// - `.alternating240x400`: one 240x400 buffer per eye; submit `.left` then `.right`. Only left
-    ///   frames are throttled (a rejected left means: skip its right too).
+    /// - `.alternating240x400`: one 240x400 buffer per eye; submit `.left` then `.right`. The pair
+    ///   is decided on its left frame (throttle, congestion); a right frame is accepted only right
+    ///   after an accepted left, so when the left returns false you may skip rendering the right
+    ///   (submitting it anyway is harmless: it returns false).
     @discardableResult
     public nonisolated func submit(pixelBuffer: CVPixelBuffer, eye: S3DSEye? = nil, throttle: Bool = true) -> Bool {
         engine.submit(pixelBuffer: pixelBuffer, eye: eye, throttled: throttle)

@@ -190,8 +190,11 @@ of wall-clock time, last ~2 s; it should equal the `sampleRate` you declare, e.g
 (input lost in the ring, normally 0). A rate above the declared one means the app produces audio
 faster than real time and the 3DS will receive more audio than it can play.
 
-Audio is never dropped by the video backpressure logic, only when the connection is down. Sends
-are asynchronous, so audio and video do not wait on each other.
+Audio is never dropped by the video congestion logic, only when the connection is down. Sends
+are asynchronous, but audio and video share one TCP stream, so audio waits behind any video
+already queued. That is why congestion is handled by skipping video before it is encoded (see
+[Congestion](#congestion)): the backlog ahead of audio stays around 150 ms, well inside the
+receiver's ~300 ms audio budget.
 
 ## Recommended settings / hardware notes
 
@@ -202,9 +205,10 @@ See [`docs/ARCHITECTURE.md` › Hardware findings](docs/PROTOCOL.md#hardware-fin
 |---|---|---|
 | `layout` | `.alternating240x400` | The 3DS MVD decoder crashes on 240x800. |
 | `framesPerSecond` | 20 stereo pairs | 40 encoded fps (L, R, L, R…). 30 pairs worked on a New 3DS XL with x264; lowered after Vision Pro device runs. |
-| `bitrate` | 1.2 Mbps | Clamped to 0.5–3 Mbps. Above ~2 Mbps risks stalls over the 3DS's Wi-Fi (2.5 Mbps stalled). |
+| `bitrate` | 1.2 Mbps | Clamped to 0.5–3 Mbps. Above ~2 Mbps risks stalls over the 3DS's Wi-Fi (2.5 Mbps stalled). With `adaptiveBitrate` it is the ceiling. |
+| `adaptiveBitrate` | `true` | Steps the encoder bitrate down (×0.8, floor 0.5 Mbps) while more than 20 % of the pairs of a 2 s window are skipped for congestion or its average backlog is ≥ 100 ms, and back up (×1.1 every 5 s without congestion) to `bitrate`. `setStartBitrate(_:)` starts lower. |
 | `keyframeInterval` | 2 × `framesPerSecond` | An IDR every 2 s (80 encoded frames), always on a **left** frame, with SPS+PPS before each IDR. Forced IDRs (connect, `KEYFRAME_REQ`, oversize/multi-slice drops) are rate-limited to 1 per second. |
-| `maxInFlightFrames` | ≈ 250 ms | 5 pairs = 10 AUs at the default rate. Beyond that, video is dropped until the next **scheduled** keyframe; no extra IDR is forced (that caused IDR storms on a congested link). |
+| `maxInFlightFrames` | ≈ 450 ms | 9 pairs = 18 AUs at the default rate. Last-resort cap on encoded video waiting for the network; see [Congestion](#congestion). |
 | `audioBitrate` | 96 kbps | Opus, 48 kHz stereo, 20 ms. |
 | `encoder` | `.automatic` | Software H.264 encoder (see below). |
 
@@ -245,11 +249,51 @@ The library always enforces the following:
   `waitUntilCompleted`.
 - `StereoEyeRenderer.render` must be called from one thread at a time. `S3DSRealityCapture` is
   main-actor.
-- At most 3 stereo frames are in flight on the GPU. If the network backs up (more than
-  `maxInFlightFrames` stereo frames, 12 AUs by default, unsent), non-key frames are dropped and
-  a new left IDR is forced once the backlog drains. Audio is exempt.
+- At most 3 stereo frames are in flight on the GPU. Network congestion skips whole pairs
+  before they reach the GPU or the encoder; see [Congestion](#congestion). Audio is exempt.
 - `connect` does not retry on its own. On failure `connectionState` is `.failed(reason)`. Call
   `connect` again, for example from a button.
+
+## Congestion
+
+A 3DS on Wi-Fi sustains roughly 0.9 Mbps, sometimes less. When the stream produces more than
+the link carries, S3DSKit keeps the latency bounded without breaking the H.264 stream:
+
+1. **Skip before encoding, per stereo pair.** The sender estimates the backlog ahead of a new
+   frame: the larger of the age of the oldest video AU still queued in Network.framework, and
+   the bytes waiting there plus the unacknowledged bytes in the TCP send buffer (sampled every
+   10 ms) at the stream's bitrate. While it is ≥ 150 ms, a pair that falls due is skipped: never
+   rotated, never encoded. The reference chain stays intact, so the stream continues with the
+   next pair and needs no keyframe. Both eyes of a pair are always skipped together.
+   `stats.congestionPairsSkipped` counts them.
+2. **Last resort after encoding.** Only if the backlog still reaches 450 ms (3×), or
+   `maxInFlightFrames`, is an encoded left (or stacked) frame dropped; a right frame whose left
+   was sent is never dropped for backpressure, so pairs stay whole on the wire. The sender then
+   waits for a keyframe and asks for one as soon as the backlog drains below 150 ms, rather than
+   waiting up to 2 s for the scheduled IDR, and never while still congested (IDR storms). A
+   `KEYFRAME_REQ` from the receiver is held back the same way. Forced IDRs stay limited to 1 per
+   second, on left frames.
+3. **Adaptive bitrate** (`adaptiveBitrate`, on by default). Skipping alone does not lower the
+   bitrate much: VideoToolbox's rate control spends the same bits per second on fewer frames. So
+   while more than 20 % of the pairs in a 2 s window are skipped, or the backlog averaged over
+   the window is at least 100 ms (a link just under the bitrate skips few pairs but stays backed
+   up), the bitrate drops by 20 % (floor 0.5 Mbps); after 5 s without a skip or a backed-up
+   window it rises by 10 %, up to `bitrate`. `stats.videoBitrate` is the value in use. To skip
+   the first seconds of stepping down on a known link, call `setStartBitrate(_:)` after
+   connecting with the rate that last worked (for example a saved `stats.videoBitrate`).
+
+The engine logs one line per second (`Logger` subsystem `S3DSKit`, category `engine`) while
+connected, for example:
+
+```
+video/s: submitted 40 encoded 40 sent 40 keys 0 dropped 0 pairs-skipped 0; 1150 kbps (bitrate 1200 kbps); in-flight 0 backlog 12 ms (socket 1 KiB); encode 2.3 ms avg (hw)
+drops/s: congestion-skipped pairs 3 backpressure 0 awaiting-keyframe 0 oversize 0 multi-slice 0 (totals 41/0/0/0/0; recovery IDRs 1)
+```
+
+The second line appears only in seconds with a skip or a drop. On a healthy link
+`pairs-skipped` and `dropped` stay at 0. A few skipped pairs right after an IDR are normal on a
+link near its limit; steady skipping with `bitrate` stepping down means the link carries less
+than the configured bitrate.
 
 ## Building and testing
 
@@ -272,6 +316,11 @@ xcodebuild test  -scheme S3DSKit -destination 'platform=visionOS Simulator,name=
 - end-to-end loopback streaming to a fake 3DS, for alternating (with interleaved audio, decoded
   back to 440 Hz, and one slice per AU), stacked, mono 1920x1440 at 90 Hz (throttle) and
   preview;
+- congestion, with a fake 3DS that reads slowly and then catches up: pairs are skipped before
+  the encoder sees them, no right frame goes out without its left, video flows again as soon as
+  the link clears (no keyframe wait), IDRs stay ≥ 1 s apart, and the bitrate steps down and back
+  up; the last-resort drop recovers with an IDR requested once the backlog drains; the
+  congestion controller on a synthetic clock;
 - the RealityKit adapter.
 
 The end-to-end tests write what they received to the simulator's temp dir and print

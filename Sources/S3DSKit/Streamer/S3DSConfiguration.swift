@@ -37,8 +37,6 @@ public struct S3DSConfiguration: Sendable, Equatable {
     public var bitrate: Int {
         didSet { bitrate = Self.clampBitrate(bitrate) }
     }
-    /// Default network budget for video in flight, in seconds.
-    static let inFlightSeconds = 0.25
     /// Allowed video bitrate range (0.5–3 Mbps).
     public static let bitrateRange = 500_000...3_000_000
     static func clampBitrate(_ b: Int) -> Int { min(max(b, bitrateRange.lowerBound), bitrateRange.upperBound) }
@@ -49,9 +47,13 @@ public struct S3DSConfiguration: Sendable, Equatable {
     public var keyframeInterval: Int
     /// Name sent in the HELLO message (≤ 64 UTF-8 bytes).
     public var senderName: String
-    /// Stereo frames allowed in flight to the network (send not yet completed). Beyond it, video
-    /// is dropped until the next *scheduled* keyframe (no extra IDR is forced). Default ≈ 250 ms
-    /// at `framesPerSecond` (5 pairs = 10 AUs at 20 pairs/s).
+    /// Hard cap of stereo frames handed to the network and not yet sent (last resort). Congestion
+    /// is normally handled before encoding: while the oldest unsent video AU is ≥ 150 ms old,
+    /// new pairs are skipped (never rotated or encoded, so no keyframe is needed afterwards).
+    /// Only when the backlog still reaches ~450 ms, or this many pairs, are encoded left frames
+    /// dropped; the stream then resumes with an IDR requested as soon as the backlog drains
+    /// (forced IDRs are limited to 1/s). Default ≈ 450 ms at `framesPerSecond` (9 pairs = 18 AUs
+    /// at 20 pairs/s).
     public var maxInFlightFrames: Int
     /// How source images are fitted, eye swapping, flipping.
     public var frameOptions: S3DSFrameOptions
@@ -61,6 +63,13 @@ public struct S3DSConfiguration: Sendable, Equatable {
     public var audioBitrate: Int
     /// Which H.264 encoder to use. Default `.automatic` (software).
     public var encoder: S3DSEncoderPreference
+    /// Adapt the encoder bitrate to the link: while more than 20 % of the stereo pairs of a 2 s
+    /// window are skipped for congestion, the bitrate drops by 20 % (floor 0.5 Mbps); after 5 s
+    /// without a skip it rises by 10 %, up to ``bitrate``. Default true. The current value is
+    /// ``S3DSStats/videoBitrate``.
+    public var adaptiveBitrate: Bool
+    /// Congestion thresholds (internal; tests shorten them).
+    var congestion = CongestionPolicy()
 
     public init(layout: S3DSLayout = .alternating240x400,
                 bitrate: Int = 1_200_000,
@@ -71,18 +80,20 @@ public struct S3DSConfiguration: Sendable, Equatable {
                 frameOptions: S3DSFrameOptions = S3DSFrameOptions(),
                 audioEnabled: Bool = true,
                 audioBitrate: Int = 96_000,
-                encoder: S3DSEncoderPreference = .automatic) {
+                encoder: S3DSEncoderPreference = .automatic,
+                adaptiveBitrate: Bool = true) {
         self.layout = layout
         self.bitrate = Self.clampBitrate(bitrate)
         self.framesPerSecond = max(1, framesPerSecond)
         self.keyframeInterval = max(1, keyframeInterval ?? 2 * self.framesPerSecond)
         self.senderName = senderName
         self.maxInFlightFrames = max(1, maxInFlightFrames
-            ?? Int((Self.inFlightSeconds * Double(self.framesPerSecond)).rounded(.up)))
+            ?? Int((congestion.dropLatency * Double(self.framesPerSecond)).rounded(.up)))
         self.frameOptions = frameOptions
         self.audioEnabled = audioEnabled
         self.audioBitrate = audioBitrate
         self.encoder = encoder
+        self.adaptiveBitrate = adaptiveBitrate
     }
 }
 
@@ -110,16 +121,26 @@ public struct S3DSStats: Sendable, Equatable {
     public var kilobitsPerSecond: Double = 0
     /// Total frames sent since the streamer was created.
     public var framesSent: Int = 0
-    /// Total frames dropped by the sender (sum of the three reasons below).
+    /// Total encoded frames dropped by the sender (sum of the three reasons below). Pairs skipped
+    /// before encoding are counted in ``congestionPairsSkipped`` instead.
     public var framesDropped: Int = 0
-    /// Dropped because the network was backed up (in-flight budget exceeded).
+    /// Dropped after encoding because the network was badly backed up (last resort; should stay
+    /// near 0 since congestion normally skips pairs before encoding).
     public var backpressureFramesDropped: Int = 0
-    /// Dropped while waiting for the next keyframe after an earlier drop.
+    /// Dropped while waiting for a keyframe after an earlier drop or a receiver KEYFRAME_REQ.
     public var awaitingKeyframeFramesDropped: Int = 0
     /// Dropped because an AU exceeded the 256 KiB payload limit.
     public var oversizeFramesDropped: Int = 0
     /// Total keyframes sent.
     public var keyframesSent: Int = 0
+    /// Total stereo pairs skipped before encoding because the link was congested (the oldest
+    /// unsent video was ≥ 150 ms old). Skipping keeps the H.264 reference chain intact, so the
+    /// stream continues without a keyframe; a steadily growing count means the link carries less
+    /// than the bitrate (see ``videoBitrate``).
+    public var congestionPairsSkipped: Int = 0
+    /// The H.264 bitrate in use, in bits per second: the configured one, or lower while
+    /// ``S3DSConfiguration/adaptiveBitrate`` backs off on a congested link.
+    public var videoBitrate: Int = 0
     /// Total Opus audio packets sent (50 per second while audio flows).
     public var audioPacketsSent: Int = 0
     /// Audio input rate actually measured: frames (per channel, before resampling) passed to

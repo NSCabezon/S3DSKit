@@ -7,6 +7,8 @@ struct StatsInput: Sendable {
     var audioFramesDropped = 0
     var encoderIsHardware: Bool?
     var multiSlicePicturesDropped = 0
+    var congestionPairsSkipped = 0
+    var videoBitrate = 0
 }
 
 /// Turns periodic counter snapshots into ``S3DSStats``. Pure (the clock is passed in), so tests
@@ -49,6 +51,8 @@ struct StatsSampler {
         s.audioDroppedInputFrames = input.audioFramesDropped
         s.encoderIsHardware = input.encoderIsHardware
         s.multiSlicePicturesDropped = input.multiSlicePicturesDropped
+        s.congestionPairsSkipped = input.congestionPairsSkipped
+        s.videoBitrate = input.videoBitrate
         return s
     }
 }

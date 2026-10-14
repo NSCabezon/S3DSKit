@@ -17,9 +17,32 @@ then re-copy it here.
   one rebuild; it never loops.
 - Defaults: alternating 240x400 at 20 pairs (40 encoded fps), 1.2 Mbps, an IDR every 2 s
   (80 frames) and only on LEFT frames (lowered from 30 pairs / 1.5 Mbps / 1 s after Vision Pro
-  device runs showed an IDR storm). Backpressure (> ~250 ms in flight) drops video until the next
-  scheduled keyframe and never forces an IDR; forced IDRs are limited to 1/s. Also Baseline, ≤ 256 KiB per AU, Opus
-  48 kHz stereo 20 ms 96 kbps. `DefaultsTests` asserts them.
+  device runs showed an IDR storm). Forced IDRs are limited to 1/s. Also Baseline, ≤ 256 KiB per
+  AU, Opus 48 kHz stereo 20 ms 96 kbps, adaptive bitrate on. `DefaultsTests` asserts them.
+- **Congestion is handled before encoding, per stereo pair** (`CongestionPolicy`,
+  `CongestionController`). Never drop an already-encoded frame as the normal reaction to a
+  backed-up link: it breaks the reference chain, everything until the next IDR is lost, and the
+  IDR re-congests the link (device run: 40 frames/s submitted, ~4 pairs/s shown). Instead:
+  - Backlog = max(age of the oldest video AU queued in Network.framework, (those bytes + the
+    unacknowledged TCP send buffer, sampled every 10 ms) at the stream's bitrate). The send
+    buffer matters: NW completes a send once data is in the socket, which can hold ~1 s on a
+    slow link.
+  - Backlog ≥ 150 ms: the due pair is skipped in `reserveCapture`/`submit` (never rotated nor
+    encoded; both eyes together; a pixel-buffer right frame is accepted only after an accepted
+    left). `stats.congestionPairsSkipped`.
+  - Backlog ≥ 450 ms (or `maxInFlightFrames`, default 9 pairs): last-resort drop of encoded
+    left/stacked frames only (a right whose left went out is always sent). The sender then
+    requests an IDR once the backlog is < 150 ms, never while congested; `KEYFRAME_REQ` is held
+    back the same way.
+  - Adaptive bitrate: > 20 % of a 2 s window's pairs skipped, or the window's average backlog
+    ≥ 100 ms → ×0.8 (floor 0.5 Mbps); 5 s without a skip or a backed-up window → ×1.1 up to the
+    configured bitrate. `stats.videoBitrate`. `setStartBitrate` starts below the ceiling (apps
+    pass the rate that last worked with that receiver). Device run: the backlog trigger exists
+    because a link just under the bitrate held 1.2 Mbps for 12 s at 5-15 % skips.
+  - The 1/s engine log shows `pairs-skipped`, `bitrate`, `backlog` and `socket` KiB.
+- `H264Encoder`'s output callback must never take the session lock (`lock`): `reset()` holds it
+  across `VTCompressionSessionCompleteFrames`, which waits for callbacks (that deadlocked every
+  encoder test). Callback-side state lives in `shared`.
 - Every SPS sent goes through `SPSRewriter` (`bitstream_restriction`, `max_num_reorder_frames = 0`,
   `max_dec_frame_buffering = max(1, refs)`). Without it the 3DS decoder delays output and the
   right eye shows an older picture than the left. Never send VideoToolbox's SPS raw.
@@ -37,7 +60,11 @@ Zero warnings. The integration tests run a fake 3DS on an ephemeral local port. 
 
 ## Status (2026-10-14)
 
-70 tests pass. Published release 0.1.0 on github.com/NSCabezon/S3DSKit. These later commits are
+79 tests pass (congestion policy added on top of WIP 6f081ed; not yet run on device). On the
+device, check the engine log: `pairs-skipped` instead of `awaiting-keyframe` drops, `dropped 0`,
+`bitrate` settling where skips stop, and the receiver's late-audio drops going away.
+
+Before that: 70 tests passed. Published release 0.1.0 on github.com/NSCabezon/S3DSKit. These later commits are
 local only, not pushed yet: SPS bitstream_restriction rewrite (2ec53b7), deadline throttle + audio
 stats (7226aa2). Release them as 0.1.1 once they're verified on the device.
 

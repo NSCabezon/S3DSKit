@@ -8,8 +8,11 @@ import os
 /// Real-time H.264 Baseline encoder producing Annex-B access units.
 ///
 /// Thread-safe: `encode`, `forceKeyframe`, `setBitrate` may be called from any thread.
-/// Output is delivered on a VideoToolbox thread. Mutable state is guarded by `lock`
-/// (a `Mutex` cannot hold the session: region isolation rejects merging the pixel buffer into it).
+/// Output is delivered on a VideoToolbox thread. Session state is guarded by `lock` (a `Mutex`
+/// cannot hold the session: region isolation rejects merging the pixel buffer into it). Whatever
+/// the output callback touches lives in `shared`, a separate lock the callback takes alone: the
+/// callback must never wait for `lock`, which `encode`/`reset` hold while VideoToolbox may wait
+/// for pending callbacks (`VTCompressionSessionCompleteFrames`), a deadlock otherwise.
 final class H264Encoder: @unchecked Sendable {
     struct Settings: Sendable {
         var layout: S3DSLayout = .alternating240x400
@@ -46,6 +49,21 @@ final class H264Encoder: @unchecked Sendable {
         var settings: Settings
         /// Whether the current (or last) session runs on the hardware encoder (nil = unknown).
         var isHardware: Bool?
+        /// Host time of the last IDR requested (nil: none yet in this session).
+        var lastIDRTime: Double?
+        /// Host times of the last IDRs this encoder asked for (forced or scheduled), newest last.
+        var keyframeTimes: [Double] = []
+        var framesSubmitted = 0
+        /// Alternating layout: left frames since the last IDR, and whether the current session
+        /// has started with a left frame (VT makes its first frame an IDR, which must be left).
+        var leftFramesSinceIDR = 0
+        var sessionStarted = false
+    }
+
+    /// State shared with the output callback (see the type comment). Lock order: `lock`, then
+    /// `shared`; the callback takes only `shared`.
+    private struct Shared {
+        var forceNextKeyframe = true
         /// `.automatic` switched to the software encoder after a hardware multi-slice picture.
         var fellBackToSoftware = false
         /// Set from the output callback; the next `encode` rebuilds on the software encoder
@@ -53,20 +71,15 @@ final class H264Encoder: @unchecked Sendable {
         var softwareRebuildPending = false
         var multiSliceDrops = 0
         var softwareRebuilds = 0
-        /// Host time of the last IDR requested (nil: none yet in this session).
-        var lastIDRTime: Double?
-        var framesSubmitted = 0
         var framesEncoded = 0
         var encodeLatencySum = 0.0
-        var forceNextKeyframe = true
-        /// Alternating layout: left frames since the last IDR, and whether the current session
-        /// has started with a left frame (VT makes its first frame an IDR, which must be left).
-        var leftFramesSinceIDR = 0
-        var sessionStarted = false
     }
+
+    private static let keyframeTimesKept = 64
 
     private let lock = NSLock()
     private var _state: State
+    private let shared = Mutex(Shared())
 
     private func withState<R>(_ body: (inout State) -> R) -> R {
         lock.lock()
@@ -75,11 +88,14 @@ final class H264Encoder: @unchecked Sendable {
     }
     private let output: Output
     private let sessionFactory: SessionFactory
+    /// `settings.encoder`, which never changes after init.
+    private let preference: S3DSEncoderPreference
     private static let log = Logger(subsystem: "S3DSKit", category: "encoder")
 
     init(settings: Settings, sessionFactory: @escaping SessionFactory = H264Encoder.makeSession,
          output: @escaping Output) {
         self._state = State(session: nil, settings: settings)
+        self.preference = settings.encoder
         self.sessionFactory = sessionFactory
         self.output = output
     }
@@ -88,13 +104,17 @@ final class H264Encoder: @unchecked Sendable {
     /// when VideoToolbox does not say).
     var isHardware: Bool? { withState { $0.isHardware } }
     /// Multi-slice pictures dropped so far (the 3DS needs exactly one slice per picture).
-    var multiSlicePicturesDropped: Int { withState { $0.multiSliceDrops } }
+    var multiSlicePicturesDropped: Int { shared.withLock { $0.multiSliceDrops } }
     /// Times the session was rebuilt on the software encoder after a multi-slice picture (≤ 1).
-    var softwareRebuilds: Int { withState { $0.softwareRebuilds } }
+    var softwareRebuilds: Int { shared.withLock { $0.softwareRebuilds } }
     /// Monotonic: frames passed to `encode`, AUs delivered, summed submit→output seconds.
     var encodeCounters: (submitted: Int, encoded: Int, latencySum: Double) {
-        withState { ($0.framesSubmitted, $0.framesEncoded, $0.encodeLatencySum) }
+        let submitted = withState { $0.framesSubmitted }
+        return shared.withLock { (submitted, $0.framesEncoded, $0.encodeLatencySum) }
     }
+    /// Host times (`systemUptime`) of the last 64 IDRs requested from VideoToolbox, forced or
+    /// scheduled, oldest first. For tests and diagnostics.
+    var keyframeTimes: [Double] { withState { $0.keyframeTimes } }
 
     deinit {
         withState { s in
@@ -103,9 +123,10 @@ final class H264Encoder: @unchecked Sendable {
         }
     }
 
-    /// Makes the next encoded frame an IDR (the next *left* frame in the alternating layout).
+    /// Makes the next encoded frame an IDR (the next *left* frame in the alternating layout),
+    /// subject to the forced-IDR rate limit (`minForcedKeyframeInterval`).
     func forceKeyframe() {
-        withState { $0.forceNextKeyframe = true }
+        shared.withLock { $0.forceNextKeyframe = true }
     }
 
     /// Changes the average bitrate (bits per second) of the running session.
@@ -124,9 +145,9 @@ final class H264Encoder: @unchecked Sendable {
                 VTCompressionSessionInvalidate(session)
             }
             s.session = nil
-            s.forceNextKeyframe = true
             s.sessionStarted = false
         }
+        forceKeyframe()
     }
 
     /// Encodes one BGRA frame of the layout's size. `eye` must be given for the alternating
@@ -137,36 +158,39 @@ final class H264Encoder: @unchecked Sendable {
         let now = ProcessInfo.processInfo.systemUptime
         withState { s in
             s.framesSubmitted += 1
-            if s.softwareRebuildPending {
-                s.softwareRebuildPending = false
+            let (rebuild, fellBack) = shared.withLock { sh in
+                defer { sh.softwareRebuildPending = false }
+                return (sh.softwareRebuildPending, sh.fellBackToSoftware)
+            }
+            if rebuild {
                 if let session = s.session { VTCompressionSessionInvalidate(session) }
                 s.session = nil
             }
             if s.session == nil {
-                let software = s.settings.encoder != .hardware || s.fellBackToSoftware
+                let software = s.settings.encoder != .hardware || fellBack
                 if let info = sessionFactory(s.settings, software) {
                     s.session = info.session
                     s.isHardware = info.isHardware
                 }
-                s.forceNextKeyframe = true
+                shared.withLock { $0.forceNextKeyframe = true }
                 s.sessionStarted = false
                 s.lastIDRTime = nil
             }
             guard let session = s.session else { return }
             // Forced IDRs at most once per `minForcedKeyframeInterval`; pending ones wait.
-            let forceAllowed = s.forceNextKeyframe
+            let forceAllowed = shared.withLock { $0.forceNextKeyframe }
                 && (s.lastIDRTime.map { now - $0 >= s.settings.minForcedKeyframeInterval } ?? true)
             let alternating = s.settings.layout == .alternating240x400
             if alternating, eye == .right, !s.sessionStarted { return }   // never start on a right frame
             var forceKey = false
             if !alternating {
                 forceKey = forceAllowed
-                if forceKey { s.forceNextKeyframe = false }
+                if forceKey { shared.withLock { $0.forceNextKeyframe = false } }
             } else if eye != .right {
                 // IDR only on left frames: pending requests wait here; plus our own cadence.
                 forceKey = forceAllowed || s.leftFramesSinceIDR + 1 >= s.settings.keyframeInterval
                 if forceKey {
-                    s.forceNextKeyframe = false
+                    shared.withLock { $0.forceNextKeyframe = false }
                     s.leftFramesSinceIDR = 0
                 } else {
                     s.leftFramesSinceIDR += 1
@@ -177,6 +201,8 @@ final class H264Encoder: @unchecked Sendable {
             if forceKey {
                 props = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
                 s.lastIDRTime = now
+                s.keyframeTimes.append(now)
+                if s.keyframeTimes.count > Self.keyframeTimesKept { s.keyframeTimes.removeFirst() }
             }
             let sessionIsHardware = s.isHardware
             let duration = CMTime(value: 1, timescale: CMTimeScale(s.settings.encoderFPS))
@@ -218,7 +244,7 @@ final class H264Encoder: @unchecked Sendable {
 
     private func recordEncoded(since submitted: Double) {
         let latency = ProcessInfo.processInfo.systemUptime - submitted
-        withState { s in
+        shared.withLock { s in
             s.framesEncoded += 1
             s.encodeLatencySum += latency
         }
@@ -229,11 +255,11 @@ final class H264Encoder: @unchecked Sendable {
     /// which honours `NumberOfSlices`; otherwise the picture is just dropped and logged. Either
     /// way an IDR follows on the next left frame. Internal for tests.
     func handleMultiSlicePicture(slices: Int, sessionIsHardware: Bool?) {
-        let (count, rebuild) = withState { s -> (Int, Bool) in
+        let (count, rebuild) = shared.withLock { s -> (Int, Bool) in
             s.multiSliceDrops += 1
             s.forceNextKeyframe = true
             // Unknown (nil) counts as hardware: the rebuild happens at most once anyway.
-            let rebuild = sessionIsHardware != false && s.settings.encoder == .automatic
+            let rebuild = sessionIsHardware != false && preference == .automatic
                 && s.softwareRebuilds == 0
             if rebuild {
                 s.softwareRebuilds += 1
