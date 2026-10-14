@@ -24,6 +24,9 @@ final class AudioRing: @unchecked Sendable {
         var sampleRate: Double = 48_000
         var generation = 0
         var lastWriteEnd: Double = 0
+        /// Frames lost before the consumer read them (overwritten when full, or discarded by a
+        /// sample-rate change). Monotonic.
+        var dropped = 0
     }
 
     let capacityFrames: Int
@@ -47,7 +50,7 @@ final class AudioRing: @unchecked Sendable {
         lock.withLockUnchecked { s in
             if s.sampleRate != sampleRate {
                 s = State(readIndex: 0, count: 0, sampleRate: sampleRate, generation: s.generation + 1,
-                          lastWriteEnd: 0)
+                          lastWriteEnd: 0, dropped: s.dropped + s.count)
             }
             // Only the newest `cap` frames can survive.
             let skip = max(0, frames - cap)
@@ -60,7 +63,9 @@ final class AudioRing: @unchecked Sendable {
             }
             let written = frames - skip
             let newCount = s.count + written
+            s.dropped += skip
             if newCount > cap {
+                s.dropped += newCount - cap
                 s.readIndex = (s.readIndex + (newCount - cap)) % cap
                 s.count = cap
             } else {
@@ -89,6 +94,10 @@ final class AudioRing: @unchecked Sendable {
                               lastWriteEnd: s.lastWriteEnd, remaining: s.count)
         }
     }
+
+    /// Total input frames lost in the ring (overwritten before being read, or discarded by a
+    /// sample-rate change). `clear()` on disconnect does not count.
+    var droppedFrames: Int { lock.withLockUnchecked { $0.dropped } }
 
     /// Drops everything buffered.
     func clear() {

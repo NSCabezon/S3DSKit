@@ -143,7 +143,7 @@ struct IntegrationTests {
     }
 
     /// Mono 1920x1440 rgba8Unorm "game frame" submitted at ~90 Hz with right: nil and no command
-    /// buffer (library queue); the throttle should pass ~30 fps.
+    /// buffer (library queue); the throttle must pass 30 stereo frames per second, not more.
     @Test func monoLargeTextureThrottled() async throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let queue = try #require(device.makeCommandQueue())
@@ -151,6 +151,7 @@ struct IntegrationTests {
         let frames = try (0..<3).map { _ in try TestShaders.texture(device, 1920, 1440) }
         var accepted = 0
         var calls = 0
+        var elapsed = 0.0
 
         let aus = try await stream(name: "s3ds_mono", layout: .alternating240x400) { streamer in
             let start = CACurrentMediaTime()
@@ -161,11 +162,14 @@ struct IntegrationTests {
                 calls += 1
                 try await Task.sleep(for: .milliseconds(11))
             }
+            elapsed = CACurrentMediaTime() - start
         }
-        print("S3DSKIT_THROTTLE calls=\(calls) accepted=\(accepted)")
-        #expect(Double(calls) > Double(accepted) * 1.5)   // 60-90 Hz calls; extra ones are no-ops
-        #expect(accepted >= 45 && accepted <= 80) // ~30 fps over 2.5 s
-        #expect(aus.count >= 80)                  // two AUs per accepted frame
+        // The first call is accepted at t = 0, then one per 1/30 s.
+        let rate = Double(accepted - 1) / elapsed
+        print("S3DSKIT_THROTTLE calls=\(calls) accepted=\(accepted) elapsed=\(elapsed) rate=\(rate)/s")
+        #expect(Double(calls) / elapsed >= 50, "test loop too slow to exercise the throttle")
+        #expect(rate >= 28 && rate <= 30.5, "accepted \(rate)/s, want 30")
+        #expect(aus.count >= 2 * accepted - 4)    // two AUs per accepted frame (tail may be cut)
     }
 
     /// Preview works without a connection.

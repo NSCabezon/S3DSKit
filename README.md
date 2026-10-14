@@ -72,7 +72,8 @@ streamer.connect(host: "192.168.1.50")     // IP shown on the 3DS bottom screen;
 ### 1. Texture pair: your app already has eye images
 
 Call it every display frame. The built-in throttle passes `framesPerSecond` (default 30) and
-returns `false` from extra calls without doing any work. For example, in a frame pump that copies
+returns `false` from extra calls without doing any work. It keeps a fixed cadence (every 2nd call
+at 60 Hz, every 3rd at 90 Hz, a 3/4 mix at 100 Hz) and restarts after pauses without a burst. For example, in a frame pump that copies
 an emulator's stereo frame each display frame, before `cb.commit()`:
 
 ```swift
@@ -183,6 +184,12 @@ Other inputs: `submitAudio(_ buffer: AVAudioPCMBuffer, hostTime:)` takes Float32
 buffers, interleaved or not (for example from an `AVAudioEngine` tap; pass `when.hostTime`).
 Interleaved stereo works with `submitAudio(samples:channels: 2, sampleRate:)`.
 
+To check the input rate, read `stats.audioInputFramesPerSecond` (frames per channel per second
+of wall-clock time, last ~2 s; it should equal the `sampleRate` you declare, e.g. 48000),
+`stats.audioPacketsPerSecond` (50 for real-time input) and `stats.audioDroppedInputFrames`
+(input lost in the ring, normally 0). A rate above the declared one means the app produces audio
+faster than real time and the 3DS will receive more audio than it can play.
+
 Audio is never dropped by the video backpressure logic, only when the connection is down. Sends
 are asynchronous, so audio and video do not wait on each other.
 
@@ -247,6 +254,8 @@ xcodebuild test  -scheme S3DSKit -destination 'platform=visionOS Simulator,name=
   and the hardware defaults;
 - GPU kernel exactness, pixel by pixel, for both layouts;
 - encoder keyframe placement (IDR only on left frames, deferred requests);
+- the frame throttle (60/90/100/120 Hz, jitter, pauses) on a synthetic clock; audio stats
+  (input rate, packet rate, ring drops);
 - Opus at 50 packets/s with 20 ms timestamps, from 48 kHz and from 44.1 kHz input, decoded back
   to a 440 Hz sine; the audio ring buffer;
 - end-to-end loopback streaming to a fake 3DS, for alternating (with interleaved audio, decoded

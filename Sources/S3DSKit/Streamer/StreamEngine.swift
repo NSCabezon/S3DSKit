@@ -18,7 +18,7 @@ final class StreamEngine: @unchecked Sendable {
     }
 
     private struct Throttle {
-        var lastCapture: Double = -.infinity
+        var limiter: FrameThrottle
         var inFlight = 0
     }
 
@@ -46,7 +46,8 @@ final class StreamEngine: @unchecked Sendable {
     private let rotator: FrameRotator?
     private let commandQueue: (any MTLCommandQueue)?
     private let connected = Flag()
-    private let throttle = Mutex(Throttle())
+    private let throttle: Mutex<Throttle>
+    private let audioFramesSubmitted = Atomic<Int>(0)
     private let options: Mutex<S3DSFrameOptions>
     private let previewEnabled = Atomic<Bool>(false)
     private let lastPreview = Mutex<Double>(-.infinity)
@@ -58,6 +59,7 @@ final class StreamEngine: @unchecked Sendable {
 
     init(configuration: S3DSConfiguration, device: (any MTLDevice)?) {
         fps = configuration.framesPerSecond
+        throttle = Mutex(Throttle(limiter: FrameThrottle(framesPerSecond: configuration.framesPerSecond)))
         layout = configuration.layout
         options = Mutex(configuration.frameOptions)
         (events, continuation) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .bufferingNewest(16))
@@ -134,11 +136,20 @@ final class StreamEngine: @unchecked Sendable {
     /// Real-time safe: copies into the ring (short lock, no allocation) when connected.
     /// `sample(frame, channel)` for channel 0/1.
     func submitAudio(frames: Int, sampleRate: Double, endTime: Double, sample: (Int, Int) -> Float) {
-        guard let audio, frames > 0, sampleRate > 0, isConnected else { return }
+        guard let audio, frames > 0, sampleRate > 0 else { return }
+        audioFramesSubmitted.add(frames, ordering: .relaxed)   // lock-free: real-time safe
+        guard isConnected else { return }
         audio.ring.write(frames: frames, sampleRate: sampleRate, endTime: endTime, sample: sample)
     }
 
     var audioEnabled: Bool { audio != nil }
+
+    /// Counters behind ``S3DSStats`` (monotonic).
+    var statsInput: StatsInput {
+        StatsInput(sender: counters,
+                   audioFramesSubmitted: audioFramesSubmitted.load(ordering: .relaxed),
+                   audioFramesDropped: audio?.ring.droppedFrames ?? 0)
+    }
 
     /// Test hook: drain the audio ring synchronously.
     func drainAudioNow() { audio?.drainNow() }
@@ -148,14 +159,9 @@ final class StreamEngine: @unchecked Sendable {
     /// Reserves a capture slot if one is due at `now` (seconds, CACurrentMediaTime clock).
     func reserveCapture(at now: Double) -> Bool {
         guard wantsFrames else { return false }
-        let interval = 1.0 / Double(fps)
         return throttle.withLock { t in
             guard t.inFlight < Self.maxGPUFramesInFlight else { return false }
-            let elapsed = now - t.lastCapture
-            guard elapsed >= interval * 0.9 else { return false }
-            // Stay on a regular cadence under display-rate jitter; resync after gaps.
-            t.lastCapture = elapsed < 2 * interval ? t.lastCapture + interval : now
-            return true
+            return t.limiter.accept(at: now)
         }
     }
 

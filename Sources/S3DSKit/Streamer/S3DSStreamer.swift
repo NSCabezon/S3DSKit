@@ -70,8 +70,7 @@ public final class S3DSStreamer {
     public nonisolated var metalError: String? { engine.metalError }
 
     @ObservationIgnored private nonisolated let engine: StreamEngine
-    @ObservationIgnored private var lastCounters = SenderCounters()
-    @ObservationIgnored private var lastCountersTime = CACurrentMediaTime()
+    @ObservationIgnored private var statsSampler = StatsSampler(now: CACurrentMediaTime())
 
     /// - Parameters:
     ///   - configuration: bitrate, frame rate, keyframe interval, frame options.
@@ -228,18 +227,6 @@ public final class S3DSStreamer {
     }
 
     private func refreshStats() {
-        let c = engine.counters
-        let now = CACurrentMediaTime()
-        let dt = max(0.001, now - lastCountersTime)
-        var s = S3DSStats()
-        s.framesPerSecond = Double(c.framesSent - lastCounters.framesSent) / dt
-        s.kilobitsPerSecond = Double(c.bytesSent - lastCounters.bytesSent) * 8 / 1000 / dt
-        s.framesSent = c.framesSent
-        s.framesDropped = c.framesDropped
-        s.keyframesSent = c.keyframesSent
-        s.audioPacketsSent = c.audioPacketsSent
-        stats = s
-        lastCounters = c
-        lastCountersTime = now
+        stats = statsSampler.update(engine.statsInput, now: CACurrentMediaTime())
     }
 }

@@ -95,6 +95,18 @@ public struct S3DSStats: Sendable, Equatable {
     public var keyframesSent: Int = 0
     /// Total Opus audio packets sent (50 per second while audio flows).
     public var audioPacketsSent: Int = 0
+    /// Audio input rate actually measured: frames (per channel, before resampling) passed to
+    /// `submitAudio` per second of wall-clock time, averaged over the last ~2 s. Counted whether
+    /// or not a receiver is connected. It should match the `sampleRate` you declare (48000 for
+    /// real-time 48 kHz audio); a higher value means the app produces audio faster than real time
+    /// (e.g. an emulator running fast, or interleaved stereo submitted with `channels: 1`), and
+    /// the 3DS will receive more audio than it can play.
+    public var audioInputFramesPerSecond: Double = 0
+    /// Opus packets sent per second, averaged over the last ~2 s (50 for real-time input).
+    public var audioPacketsPerSecond: Double = 0
+    /// Total audio input frames lost before encoding: overwritten in the input ring (~4 s at 48 kHz) because
+    /// the encoder fell behind, or discarded when the input sample rate changed. Normally 0.
+    public var audioDroppedInputFrames: Int = 0
 
     public init() {}
 }

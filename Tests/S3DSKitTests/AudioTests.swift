@@ -102,6 +102,68 @@ struct AudioTests {
         #expect(OpusTestSupport.rms(decoded) > 0.2)
     }
 
+    /// Real-time 48 kHz interleaved stereo (10 ms callbacks on a synthetic clock) through the ring
+    /// and encoder: the stats must show 48000 input frames/s and 50 packets/s, no drops.
+    @Test(arguments: [48_000.0, 44_100.0])
+    func statsMeasureInputRateAndPacketRate(rate: Double) {
+        let packets = Mutex(0)
+        let pipeline = AudioPipeline(bitrate: 96_000) { _, _ in packets.withLock { $0 += 1 } }
+        let t0 = 1000.0
+        var sampler = StatsSampler(now: t0)
+        var input = StatsInput()
+        var stats: [S3DSStats] = []
+        let chunk = Int(rate / 100)
+        var interleaved = [Float](repeating: 0, count: chunk * 2)
+        for tick in 1...600 {                                   // 6 s of 10 ms callbacks
+            let now = t0 + Double(tick) / 100
+            for i in 0..<chunk {
+                let v = Float(0.5 * sin(2 * Double.pi * 440 * Double((tick - 1) * chunk + i) / rate))
+                interleaved[2 * i] = v
+                interleaved[2 * i + 1] = -v
+            }
+            interleaved.withUnsafeBufferPointer { buf in       // same indexing as submitAudio(samples:channels: 2)
+                pipeline.ring.write(frames: chunk, sampleRate: rate, endTime: now) { f, ch in buf[f * 2 + ch] }
+            }
+            input.audioFramesSubmitted += chunk
+            pipeline.drainNow()
+            if tick % 100 == 0 {                                 // stats refresh once per second
+                input.sender.audioPacketsSent = packets.withLock { $0 }
+                input.audioFramesDropped = pipeline.ring.droppedFrames
+                stats.append(sampler.update(input, now: now))
+            }
+        }
+        for s in stats.dropFirst(2) {                            // window full from t = 2 s
+            #expect(abs(s.audioInputFramesPerSecond - rate) < 1, "input \(s.audioInputFramesPerSecond)/s")
+            #expect(abs(s.audioPacketsPerSecond - 50) <= 1, "packets \(s.audioPacketsPerSecond)/s")
+            #expect(s.audioDroppedInputFrames == 0)
+        }
+        #expect(abs(packets.withLock { $0 } - 300) <= 3)        // 6 s → 300 packets, never more
+    }
+
+    @Test func statsWindowIsTwoSeconds() {
+        var sampler = StatsSampler(now: 0)
+        var input = StatsInput()
+        input.audioFramesSubmitted = 96_000                      // 2 s worth arrives in the 1st second
+        _ = sampler.update(input, now: 1)
+        let s2 = sampler.update(input, now: 2)                   // nothing in the 2nd second
+        #expect(s2.audioInputFramesPerSecond == 48_000)          // window [0, 2]
+        let s3 = sampler.update(input, now: 3)
+        #expect(s3.audioInputFramesPerSecond == 0)               // window [1, 3]
+    }
+
+    @Test func ringCountsDroppedFrames() {
+        let ring = AudioRing(capacityFrames: 4)
+        ring.write(frames: 3, sampleRate: 48_000, endTime: 1) { _, _ in 0 }
+        ring.write(frames: 3, sampleRate: 48_000, endTime: 2) { _, _ in 0 }   // 2 overwritten
+        #expect(ring.droppedFrames == 2)
+        ring.write(frames: 10, sampleRate: 48_000, endTime: 3) { _, _ in 0 }  // 4 old + 6 skipped
+        #expect(ring.droppedFrames == 12)
+        ring.write(frames: 1, sampleRate: 44_100, endTime: 4) { _, _ in 0 }   // rate change drops 4
+        #expect(ring.droppedFrames == 16)
+        ring.clear()
+        #expect(ring.droppedFrames == 16)
+    }
+
     @Test func ringOverwritesOldestAndResetsOnRateChange() {
         let ring = AudioRing(capacityFrames: 4)
         ring.write(frames: 6, sampleRate: 48_000, endTime: 1) { f, ch in Float(f * 10 + ch) }
