@@ -36,9 +36,9 @@ whenever the 3DS sends `KEYFRAME_REQ`.
 ## Adding the package
 
 - **Git URL:** Xcode ▸ File ▸ Add Package Dependencies… ▸ `https://github.com/NSCabezon/S3DSKit`,
-  rule "Up to Next Major Version" from `0.1.0`. In `Package.swift`:
+  rule "Up to Next Major Version" from `0.1.1`. In `Package.swift`:
   ```swift
-  .package(url: "https://github.com/NSCabezon/S3DSKit", from: "0.1.0")
+  .package(url: "https://github.com/NSCabezon/S3DSKit", from: "0.1.1")
   ```
 - **Local path:** Add Local… ▸ pick your `S3DSKit` checkout. With XcodeGen:
   ```yaml

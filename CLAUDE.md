@@ -62,13 +62,11 @@ Zero warnings. The integration tests run a fake 3DS on an ephemeral local port. 
 
 ## Status (2026-10-14)
 
-79 tests pass (congestion policy added on top of WIP 6f081ed; not yet run on device). On the
-device, check the engine log: `pairs-skipped` instead of `awaiting-keyframe` drops, `dropped 0`,
-`bitrate` settling where skips stop, and the receiver's late-audio drops going away.
-
-Before that: 70 tests passed. Published release 0.1.0 on github.com/NSCabezon/S3DSKit. These later commits are
-local only, not pushed yet: SPS bitstream_restriction rewrite (2ec53b7), deadline throttle + audio
-stats (7226aa2). Release them as 0.1.1 once they're verified on the device.
+Release 0.1.1 published. 83 tests pass. Verified on a Vision Pro → New 3DS XL (Time Crisis app): right eye in
+sync (SPS rewrite), 21 pairs/s on the 3DS with 0 post-encode drops (was ~4 pairs/s), audio buffer full, the
+adaptive bitrate stepping straight to the link fit, and the app's per-host start bitrate working. On a weak
+Wi-Fi link it sits at the 0.5 Mbps floor and skips pairs (~16 pairs/s); a lower floor or a lower frame rate at
+the floor are the options if that matters. The hardware encoder overshoots its target by 20-50 %.
 
 First real-device run (a visionOS game app at 90 Hz, built against the pre-split package): stereo
 works, and the right-eye lag is fixed by the SPS rewrite plus the receiver's SPS patch. Still to
