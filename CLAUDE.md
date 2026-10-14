@@ -10,8 +10,15 @@ then re-copy it here.
 - H.264 must be **exactly one slice per frame**. VideoToolbox splits pictures by default, and a
   multi-slice frame crashes the 3DS `mvd` sysmodule. `H264Encoder` sets the session's
   `NumberOfSlices` to 1 and checks every picture. Never remove that check.
-- Defaults are the hardware-proven ones: alternating 240x400 at 60 fps, 1.5 Mbps, an IDR every
-  60 frames and only on LEFT frames, Baseline, ≤ 256 KiB per AU, ≤ 200 ms of video in flight, Opus
+- `H264Encoder` defaults to the **software** encoder (`S3DSConfiguration.encoder = .automatic`)
+  because the Vision Pro hardware encoder was suspected of ignoring `NumberOfSlices` (being
+  verified on device). On a real Vision Pro the software request is ignored (the session reports
+  hardware) and no multi-slice pictures were seen. A hardware multi-slice picture triggers at most
+  one rebuild; it never loops.
+- Defaults: alternating 240x400 at 20 pairs (40 encoded fps), 1.2 Mbps, an IDR every 2 s
+  (80 frames) and only on LEFT frames (lowered from 30 pairs / 1.5 Mbps / 1 s after Vision Pro
+  device runs showed an IDR storm). Backpressure (> ~250 ms in flight) drops video until the next
+  scheduled keyframe and never forces an IDR; forced IDRs are limited to 1/s. Also Baseline, ≤ 256 KiB per AU, Opus
   48 kHz stereo 20 ms 96 kbps. `DefaultsTests` asserts them.
 - Every SPS sent goes through `SPSRewriter` (`bitstream_restriction`, `max_num_reorder_frames = 0`,
   `max_dec_frame_buffering = max(1, refs)`). Without it the 3DS decoder delays output and the
@@ -30,7 +37,7 @@ Zero warnings. The integration tests run a fake 3DS on an ephemeral local port. 
 
 ## Status (2026-10-14)
 
-65 tests pass. Published release 0.1.0 on github.com/NSCabezon/S3DSKit. These later commits are
+70 tests pass. Published release 0.1.0 on github.com/NSCabezon/S3DSKit. These later commits are
 local only, not pushed yet: SPS bitstream_restriction rewrite (2ec53b7), deadline throttle + audio
 stats (7226aa2). Release them as 0.1.1 once they're verified on the device.
 

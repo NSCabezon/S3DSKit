@@ -227,6 +227,8 @@ public final class S3DSStreamer {
     }
 
     private func refreshStats() {
-        stats = statsSampler.update(engine.statsInput, now: CACurrentMediaTime())
+        let now = CACurrentMediaTime()
+        stats = statsSampler.update(engine.statsInput, now: now)
+        engine.logSummary(now: now)
     }
 }

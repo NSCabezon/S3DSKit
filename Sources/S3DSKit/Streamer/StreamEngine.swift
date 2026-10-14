@@ -52,6 +52,15 @@ final class StreamEngine: @unchecked Sendable {
     private let previewEnabled = Atomic<Bool>(false)
     private let lastPreview = Mutex<Double>(-.infinity)
     private let lastPTS = Mutex<CMTime>(.invalid)
+    private struct SummarySnapshot {
+        var time: Double
+        var sender: SenderCounters
+        var submitted: Int
+        var encoded: Int
+        var latencySum: Double
+        var multiSlice: Int
+    }
+    private let lastSummary = Mutex<SummarySnapshot?>(nil)
     private static let log = Logger(subsystem: "S3DSKit", category: "engine")
 
     /// Why GPU input is unavailable (nil when it works).
@@ -67,7 +76,8 @@ final class StreamEngine: @unchecked Sendable {
         let link = SenderLink()
         let encoder = H264Encoder(
             settings: .init(layout: configuration.layout, bitrate: configuration.bitrate,
-                            fps: configuration.framesPerSecond, keyframeInterval: configuration.keyframeInterval),
+                            fps: configuration.framesPerSecond, keyframeInterval: configuration.keyframeInterval,
+                            encoder: configuration.encoder),
             output: { data, isKey, eye in
                 link.sender.withLock { $0 }?.sendVideo(data, isKeyframe: isKey, eye: eye)
             })
@@ -148,7 +158,46 @@ final class StreamEngine: @unchecked Sendable {
     var statsInput: StatsInput {
         StatsInput(sender: counters,
                    audioFramesSubmitted: audioFramesSubmitted.load(ordering: .relaxed),
-                   audioFramesDropped: audio?.ring.droppedFrames ?? 0)
+                   audioFramesDropped: audio?.ring.droppedFrames ?? 0,
+                   encoderIsHardware: encoder.isHardware,
+                   multiSlicePicturesDropped: encoder.multiSlicePicturesDropped)
+    }
+
+    /// Logs (info) a one-line sender summary, plus a drop-reason line when anything was dropped
+    /// since the last call. Call about once per second; calls closer than 0.9 s are ignored.
+    func logSummary(now: Double) {
+        let c = counters
+        let e = encoder.encodeCounters
+        let multi = encoder.multiSlicePicturesDropped
+        let snap = SummarySnapshot(time: now, sender: c, submitted: e.submitted, encoded: e.encoded,
+                                   latencySum: e.latencySum, multiSlice: multi)
+        let previous: SummarySnapshot? = lastSummary.withLock { last in
+            if let l = last, now - l.time < 0.9 { return nil }
+            defer { last = snap }
+            return last ?? SummarySnapshot(time: now - 1, sender: SenderCounters(), submitted: 0, encoded: 0,
+                                           latencySum: 0, multiSlice: 0)
+        }
+        guard let p = previous, isConnected else { return }
+        let dt = max(0.001, now - p.time)
+        let encoded = e.encoded - p.encoded
+        let latencyMs = encoded > 0 ? (e.latencySum - p.latencySum) / Double(encoded) * 1000 : 0
+        let hw = encoder.isHardware.map { $0 ? "hw" : "sw" } ?? "?"
+        Self.log.info("""
+            video/s: submitted \(e.submitted - p.submitted) encoded \(encoded) sent \(c.framesSent - p.sender.framesSent) \
+            keys \(c.keyframesSent - p.sender.keyframesSent) dropped \(c.framesDropped - p.sender.framesDropped); \
+            \(Int(Double(c.bytesSent - p.sender.bytesSent) * 8 / 1000 / dt)) kbps; in-flight \(c.inFlight); \
+            encode \(String(format: "%.1f", latencyMs)) ms avg (\(hw))
+            """)
+        let bp = c.backpressureDropped - p.sender.backpressureDropped
+        let gate = c.awaitingKeyframeDropped - p.sender.awaitingKeyframeDropped
+        let big = c.oversizeDropped - p.sender.oversizeDropped
+        let ms = multi - p.multiSlice
+        if bp + gate + big + ms > 0 {
+            Self.log.info("""
+                drops/s: backpressure \(bp) awaiting-keyframe \(gate) oversize \(big) multi-slice \(ms) \
+                (totals \(c.backpressureDropped)/\(c.awaitingKeyframeDropped)/\(c.oversizeDropped)/\(multi))
+                """)
+        }
     }
 
     /// Test hook: drain the audio ring synchronously.

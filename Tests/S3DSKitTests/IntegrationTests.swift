@@ -1,5 +1,8 @@
+import CoreMedia
+import CoreVideo
 import Foundation
 import Metal
+import Synchronization
 import QuartzCore
 import Testing
 import simd
@@ -170,6 +173,64 @@ struct IntegrationTests {
         #expect(Double(calls) / elapsed >= 50, "test loop too slow to exercise the throttle")
         #expect(rate >= 28 && rate <= 30.5, "accepted \(rate)/s, want 30")
         #expect(aus.count >= 2 * accepted - 4)    // two AUs per accepted frame (tail may be cut)
+    }
+
+    /// Real-time budget of the default (software) encoder: 60 encoded fps of 240x400, paced like
+    /// the streamer, average submit→output latency per frame must stay under 10 ms.
+    @Test func softwareEncoderLatencyAt60fps() async throws {
+        final class Timing: Sendable {
+            let submitted = Mutex<[Double]>([])
+            let delivered = Mutex<[Double]>([])
+        }
+        let timing = Timing()
+        let encoder = H264Encoder(settings: .init()) { _, _, _ in
+            timing.delivered.withLock { $0.append(CACurrentMediaTime()) }
+        }
+        let buffers = try (0..<12).map { try Self.patternBuffer(seed: $0) }
+        let frames = 120
+        let start = CACurrentMediaTime()
+        for i in 0..<frames {
+            let target = start + Double(i) / 60
+            if target > CACurrentMediaTime() {
+                try await Task.sleep(for: .milliseconds(max(1, Int((target - CACurrentMediaTime()) * 1000))))
+            }
+            timing.submitted.withLock { $0.append(CACurrentMediaTime()) }
+            encoder.encode(buffers[i % buffers.count], presentationTime: CMTime(value: CMTimeValue(i), timescale: 60),
+                           eye: i % 2 == 0 ? .left : .right)
+        }
+        _ = await waitUntil { timing.delivered.withLock { $0.count } >= frames }
+        encoder.reset()
+        let sent = timing.submitted.withLock { $0 }
+        let got = timing.delivered.withLock { $0 }
+        try #require(got.count == frames, "delivered \(got.count)/\(frames)")
+        let avgMs = zip(got, sent).map { $0 - $1 }.reduce(0, +) / Double(frames) * 1000
+        let maxMs = (zip(got, sent).map { $0 - $1 }.max() ?? 0) * 1000
+        print("S3DSKIT_ENCODE_LATENCY hardware=\(String(describing: encoder.isHardware)) "
+              + "avg=\(String(format: "%.2f", avgMs)) ms max=\(String(format: "%.2f", maxMs)) ms")
+        #expect(encoder.isHardware == false)
+        #expect(encoder.multiSlicePicturesDropped == 0)
+        #expect(avgMs < 10, "average encode latency \(avgMs) ms")
+    }
+
+    nonisolated static func patternBuffer(seed: Int) throws -> CVPixelBuffer {
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
+        let st = CVPixelBufferCreate(nil, 240, 400, kCVPixelFormatType_32BGRA, attrs, &pb)
+        let buffer = try #require(st == kCVReturnSuccess ? pb : nil)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+        let stride = CVPixelBufferGetBytesPerRow(buffer)
+        for y in 0..<400 {
+            for x in 0..<240 {
+                let p = base + y * stride + x * 4
+                p[0] = UInt8(truncatingIfNeeded: x &* 3 &+ seed &* 11)
+                p[1] = UInt8(truncatingIfNeeded: (x ^ y) &+ seed &* 7)
+                p[2] = UInt8(truncatingIfNeeded: y &* 2 &- seed &* 5)
+                p[3] = 255
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        return buffer
     }
 
     /// Preview works without a connection.

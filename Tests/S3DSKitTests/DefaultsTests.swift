@@ -8,14 +8,16 @@ struct DefaultsTests {
     @Test func configurationDefaults() {
         let c = S3DSConfiguration()
         #expect(c.layout == .alternating240x400)
-        #expect(c.framesPerSecond == 30)                 // stereo pairs → 60 encoded fps
-        #expect(c.framesPerSecond * c.layout.framesPerPair == 60)
-        #expect(c.bitrate == 1_500_000)
-        #expect(c.keyframeInterval * c.layout.framesPerPair == 60)   // IDR every 60 frames = 1 s
-        #expect(c.maxInFlightFrames * c.layout.framesPerPair == 12)  // ≤ 200 ms of video ahead
+        #expect(c.framesPerSecond == 20)                 // stereo pairs → 40 encoded fps
+        #expect(c.framesPerSecond * c.layout.framesPerPair == 40)
+        #expect(c.bitrate == 1_200_000)
+        #expect(c.keyframeInterval * c.layout.framesPerPair == 80)   // IDR every 80 frames = 2 s
+        #expect(c.maxInFlightFrames * c.layout.framesPerPair == 10)  // ≈ 250 ms of video ahead
+        #expect(S3DSConfiguration(framesPerSecond: 30).keyframeInterval == 60)   // follows the rate
         #expect(c.audioEnabled)
         #expect(c.audioBitrate == 96_000)
         #expect(c.frameOptions == S3DSFrameOptions(fit: .letterbox, swapEyes: false, flipY: false))
+        #expect(c.encoder == .automatic)   // software encoder: the HW one may ignore NumberOfSlices
     }
 
     @Test func bitrateIsClamped() {
@@ -36,6 +38,8 @@ struct DefaultsTests {
 
     @Test func encoderSettingsDefaults() {
         let s = H264Encoder.Settings()
-        #expect(s.width == 240 && s.height == 400 && s.encoderFPS == 60 && s.bitrate == 1_500_000)
+        #expect(s.width == 240 && s.height == 400 && s.encoderFPS == 40 && s.bitrate == 1_200_000)
+        #expect(s.keyframeInterval == 40 && s.minForcedKeyframeInterval == 1.0)
+        #expect(s.encoder == .automatic)
     }
 }

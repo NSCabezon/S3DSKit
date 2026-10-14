@@ -14,28 +14,44 @@ public enum S3DSLayout: Sendable, Equatable {
     public var framesPerPair: Int { self == .alternating240x400 ? 2 : 1 }
 }
 
+/// Which VideoToolbox H.264 encoder to use.
+public enum S3DSEncoderPreference: Sendable, Equatable {
+    /// Software encoder (240x400 costs little CPU), because the Vision Pro's hardware encoder is
+    /// suspected to ignore `NumberOfSlices = 1`. If a hardware session is ever in use (software
+    /// unavailable) and emits a multi-slice picture, the session is rebuilt once on software.
+    /// Default.
+    case automatic
+    /// Always ask for the software encoder; multi-slice pictures are dropped and logged.
+    case software
+    /// VideoToolbox's default choice (hardware on device); multi-slice pictures are dropped and
+    /// logged, never switched.
+    case hardware
+}
+
 /// Encoder and transport settings for an ``S3DSStreamer``.
 public struct S3DSConfiguration: Sendable, Equatable {
     /// Stream layout (must match what the receiver expects).
     public var layout: S3DSLayout
-    /// Average H.264 bitrate in bits per second, clamped to ``bitrateRange``. 1.5 Mbps is clean
+    /// Average H.264 bitrate in bits per second, clamped to ``bitrateRange``. Default 1.2 Mbps; 1.5 Mbps was clean
     /// over the 3DS's Wi-Fi; above ~2 Mbps risks stalls (2.5 Mbps stalled on hardware).
     public var bitrate: Int {
         didSet { bitrate = Self.clampBitrate(bitrate) }
     }
+    /// Default network budget for video in flight, in seconds.
+    static let inFlightSeconds = 0.25
     /// Allowed video bitrate range (0.5–3 Mbps).
     public static let bitrateRange = 500_000...3_000_000
     static func clampBitrate(_ b: Int) -> Int { min(max(b, bitrateRange.lowerBound), bitrateRange.upperBound) }
     /// Target stereo frame rate (pairs per second). With `.alternating240x400` the encoder runs
     /// at twice this rate. Submissions arriving faster are dropped by the built-in throttle.
     public var framesPerSecond: Int
-    /// Maximum stereo frames (pairs) between keyframes (the contract asks for ≤ 1 s).
+    /// Stereo frames (pairs) between scheduled keyframes. Default `2 * framesPerSecond` (2 s).
     public var keyframeInterval: Int
     /// Name sent in the HELLO message (≤ 64 UTF-8 bytes).
     public var senderName: String
-    /// Stereo frames allowed in flight to the network (send not yet completed) before non-key
-    /// frames are dropped and an IDR is forced on the next left frame. Default 6 = 12 AUs = 200 ms
-    /// at 60 fps in the alternating layout (the receiver's burst budget).
+    /// Stereo frames allowed in flight to the network (send not yet completed). Beyond it, video
+    /// is dropped until the next *scheduled* keyframe (no extra IDR is forced). Default ≈ 250 ms
+    /// at `framesPerSecond` (5 pairs = 10 AUs at 20 pairs/s).
     public var maxInFlightFrames: Int
     /// How source images are fitted, eye swapping, flipping.
     public var frameOptions: S3DSFrameOptions
@@ -43,25 +59,30 @@ public struct S3DSConfiguration: Sendable, Equatable {
     public var audioEnabled: Bool
     /// Opus bitrate in bits per second.
     public var audioBitrate: Int
+    /// Which H.264 encoder to use. Default `.automatic` (software).
+    public var encoder: S3DSEncoderPreference
 
     public init(layout: S3DSLayout = .alternating240x400,
-                bitrate: Int = 1_500_000,
-                framesPerSecond: Int = 30,
-                keyframeInterval: Int = 30,
+                bitrate: Int = 1_200_000,
+                framesPerSecond: Int = 20,
+                keyframeInterval: Int? = nil,
                 senderName: String = "S3DSKit",
-                maxInFlightFrames: Int = 6,
+                maxInFlightFrames: Int? = nil,
                 frameOptions: S3DSFrameOptions = S3DSFrameOptions(),
                 audioEnabled: Bool = true,
-                audioBitrate: Int = 96_000) {
+                audioBitrate: Int = 96_000,
+                encoder: S3DSEncoderPreference = .automatic) {
         self.layout = layout
         self.bitrate = Self.clampBitrate(bitrate)
         self.framesPerSecond = max(1, framesPerSecond)
-        self.keyframeInterval = max(1, keyframeInterval)
+        self.keyframeInterval = max(1, keyframeInterval ?? 2 * self.framesPerSecond)
         self.senderName = senderName
-        self.maxInFlightFrames = max(1, maxInFlightFrames)
+        self.maxInFlightFrames = max(1, maxInFlightFrames
+            ?? Int((Self.inFlightSeconds * Double(self.framesPerSecond)).rounded(.up)))
         self.frameOptions = frameOptions
         self.audioEnabled = audioEnabled
         self.audioBitrate = audioBitrate
+        self.encoder = encoder
     }
 }
 
@@ -89,8 +110,14 @@ public struct S3DSStats: Sendable, Equatable {
     public var kilobitsPerSecond: Double = 0
     /// Total frames sent since the streamer was created.
     public var framesSent: Int = 0
-    /// Total frames dropped by backpressure / keyframe gating.
+    /// Total frames dropped by the sender (sum of the three reasons below).
     public var framesDropped: Int = 0
+    /// Dropped because the network was backed up (in-flight budget exceeded).
+    public var backpressureFramesDropped: Int = 0
+    /// Dropped while waiting for the next keyframe after an earlier drop.
+    public var awaitingKeyframeFramesDropped: Int = 0
+    /// Dropped because an AU exceeded the 256 KiB payload limit.
+    public var oversizeFramesDropped: Int = 0
     /// Total keyframes sent.
     public var keyframesSent: Int = 0
     /// Total Opus audio packets sent (50 per second while audio flows).
@@ -107,6 +134,12 @@ public struct S3DSStats: Sendable, Equatable {
     /// Total audio input frames lost before encoding: overwritten in the input ring (~4 s at 48 kHz) because
     /// the encoder fell behind, or discarded when the input sample rate changed. Normally 0.
     public var audioDroppedInputFrames: Int = 0
+    /// Whether the H.264 session runs on the hardware encoder (nil before the first frame, or
+    /// when VideoToolbox does not say). `false` with the default `.automatic` encoder.
+    public var encoderIsHardware: Bool?
+    /// Total encoded pictures dropped because they had more than one slice (the 3DS decoder
+    /// needs exactly one). Should stay 0.
+    public var multiSlicePicturesDropped: Int = 0
 
     public init() {}
 }

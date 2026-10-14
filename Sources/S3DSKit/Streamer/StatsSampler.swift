@@ -5,6 +5,8 @@ struct StatsInput: Sendable {
     var audioFramesSubmitted = 0
     /// Audio frames lost in the ring before encoding.
     var audioFramesDropped = 0
+    var encoderIsHardware: Bool?
+    var multiSlicePicturesDropped = 0
 }
 
 /// Turns periodic counter snapshots into ``S3DSStats``. Pure (the clock is passed in), so tests
@@ -35,6 +37,9 @@ struct StatsSampler {
         s.kilobitsPerSecond = Double(c.bytesSent - last.input.sender.bytesSent) * 8 / 1000 / dt
         s.framesSent = c.framesSent
         s.framesDropped = c.framesDropped
+        s.backpressureFramesDropped = c.backpressureDropped
+        s.awaitingKeyframeFramesDropped = c.awaitingKeyframeDropped
+        s.oversizeFramesDropped = c.oversizeDropped
         s.keyframesSent = c.keyframesSent
         s.audioPacketsSent = c.audioPacketsSent
         s.audioInputFramesPerSecond =
@@ -42,6 +47,8 @@ struct StatsSampler {
         s.audioPacketsPerSecond =
             Double(c.audioPacketsSent - oldest.input.sender.audioPacketsSent) / window
         s.audioDroppedInputFrames = input.audioFramesDropped
+        s.encoderIsHardware = input.encoderIsHardware
+        s.multiSlicePicturesDropped = input.multiSlicePicturesDropped
         return s
     }
 }

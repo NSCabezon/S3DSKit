@@ -13,11 +13,16 @@ import os
 final class H264Encoder: @unchecked Sendable {
     struct Settings: Sendable {
         var layout: S3DSLayout = .alternating240x400
-        var bitrate: Int = 1_500_000
+        var bitrate: Int = 1_200_000
         /// Stereo pairs per second (the encoder runs at `fps * layout.framesPerPair`).
-        var fps: Int = 30
-        /// Pairs between keyframes.
-        var keyframeInterval: Int = 30
+        var fps: Int = 20
+        /// Pairs between scheduled keyframes (2 s at the default rate).
+        var keyframeInterval: Int = 40
+        /// Minimum seconds between *forced* IDRs (connect, KEYFRAME_REQ, drops). A request inside
+        /// the window waits until it ends (or the next scheduled keyframe). 0 disables the limit.
+        var minForcedKeyframeInterval: Double = 1.0
+        /// Which VideoToolbox encoder to ask for (see ``S3DSEncoderPreference``).
+        var encoder: S3DSEncoderPreference = .automatic
 
         var width: Int32 { Int32(layout.frameWidth) }
         var height: Int32 { Int32(layout.frameHeight) }
@@ -27,9 +32,32 @@ final class H264Encoder: @unchecked Sendable {
     /// `(annexBAccessUnit, isKeyframe, eye)`; `eye` is nil for the stacked layout.
     typealias Output = @Sendable (Data, Bool, S3DSEye?) -> Void
 
+    /// A created session and whether VideoToolbox reports it as hardware (nil = unknown).
+    struct SessionInfo {
+        var session: VTCompressionSession
+        var isHardware: Bool?
+    }
+
+    /// Creates a session; `software` asks for the software encoder. Injectable for tests.
+    typealias SessionFactory = @Sendable (Settings, _ software: Bool) -> SessionInfo?
+
     private struct State {
         var session: VTCompressionSession?
         var settings: Settings
+        /// Whether the current (or last) session runs on the hardware encoder (nil = unknown).
+        var isHardware: Bool?
+        /// `.automatic` switched to the software encoder after a hardware multi-slice picture.
+        var fellBackToSoftware = false
+        /// Set from the output callback; the next `encode` rebuilds on the software encoder
+        /// (a session must not be invalidated from its own output callback).
+        var softwareRebuildPending = false
+        var multiSliceDrops = 0
+        var softwareRebuilds = 0
+        /// Host time of the last IDR requested (nil: none yet in this session).
+        var lastIDRTime: Double?
+        var framesSubmitted = 0
+        var framesEncoded = 0
+        var encodeLatencySum = 0.0
         var forceNextKeyframe = true
         /// Alternating layout: left frames since the last IDR, and whether the current session
         /// has started with a left frame (VT makes its first frame an IDR, which must be left).
@@ -46,11 +74,26 @@ final class H264Encoder: @unchecked Sendable {
         return body(&_state)
     }
     private let output: Output
+    private let sessionFactory: SessionFactory
     private static let log = Logger(subsystem: "S3DSKit", category: "encoder")
 
-    init(settings: Settings, output: @escaping Output) {
+    init(settings: Settings, sessionFactory: @escaping SessionFactory = H264Encoder.makeSession,
+         output: @escaping Output) {
         self._state = State(session: nil, settings: settings)
+        self.sessionFactory = sessionFactory
         self.output = output
+    }
+
+    /// Whether the current session uses the hardware encoder (nil before the first session, or
+    /// when VideoToolbox does not say).
+    var isHardware: Bool? { withState { $0.isHardware } }
+    /// Multi-slice pictures dropped so far (the 3DS needs exactly one slice per picture).
+    var multiSlicePicturesDropped: Int { withState { $0.multiSliceDrops } }
+    /// Times the session was rebuilt on the software encoder after a multi-slice picture (≤ 1).
+    var softwareRebuilds: Int { withState { $0.softwareRebuilds } }
+    /// Monotonic: frames passed to `encode`, AUs delivered, summed submit→output seconds.
+    var encodeCounters: (submitted: Int, encoded: Int, latencySum: Double) {
+        withState { ($0.framesSubmitted, $0.framesEncoded, $0.encodeLatencySum) }
     }
 
     deinit {
@@ -90,22 +133,38 @@ final class H264Encoder: @unchecked Sendable {
     /// layout (nil for stacked).
     func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime, eye: S3DSEye?) {
         let output = self.output
+        let sessionFactory = self.sessionFactory
+        let now = ProcessInfo.processInfo.systemUptime
         withState { s in
+            s.framesSubmitted += 1
+            if s.softwareRebuildPending {
+                s.softwareRebuildPending = false
+                if let session = s.session { VTCompressionSessionInvalidate(session) }
+                s.session = nil
+            }
             if s.session == nil {
-                s.session = Self.makeSession(settings: s.settings)
+                let software = s.settings.encoder != .hardware || s.fellBackToSoftware
+                if let info = sessionFactory(s.settings, software) {
+                    s.session = info.session
+                    s.isHardware = info.isHardware
+                }
                 s.forceNextKeyframe = true
                 s.sessionStarted = false
+                s.lastIDRTime = nil
             }
             guard let session = s.session else { return }
+            // Forced IDRs at most once per `minForcedKeyframeInterval`; pending ones wait.
+            let forceAllowed = s.forceNextKeyframe
+                && (s.lastIDRTime.map { now - $0 >= s.settings.minForcedKeyframeInterval } ?? true)
             let alternating = s.settings.layout == .alternating240x400
             if alternating, eye == .right, !s.sessionStarted { return }   // never start on a right frame
             var forceKey = false
             if !alternating {
-                forceKey = s.forceNextKeyframe
-                s.forceNextKeyframe = false
+                forceKey = forceAllowed
+                if forceKey { s.forceNextKeyframe = false }
             } else if eye != .right {
                 // IDR only on left frames: pending requests wait here; plus our own cadence.
-                forceKey = s.forceNextKeyframe || s.leftFramesSinceIDR + 1 >= s.settings.keyframeInterval
+                forceKey = forceAllowed || s.leftFramesSinceIDR + 1 >= s.settings.keyframeInterval
                 if forceKey {
                     s.forceNextKeyframe = false
                     s.leftFramesSinceIDR = 0
@@ -117,7 +176,9 @@ final class H264Encoder: @unchecked Sendable {
             var props: CFDictionary?
             if forceKey {
                 props = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+                s.lastIDRTime = now
             }
+            let sessionIsHardware = s.isHardware
             let duration = CMTime(value: 1, timescale: CMTimeScale(s.settings.encoderFPS))
             let status = VTCompressionSessionEncodeFrame(
                 session,
@@ -128,10 +189,18 @@ final class H264Encoder: @unchecked Sendable {
                 infoFlagsOut: nil
             ) { [weak self] status, _, sampleBuffer in
                 guard status == noErr, let sampleBuffer else { return }
-                guard let (data, key) = H264Encoder.annexB(from: sampleBuffer) else {
+                let data: Data, key: Bool
+                switch H264Encoder.annexBResult(from: sampleBuffer) {
+                case .accessUnit(let d, let k):
+                    (data, key) = (d, k)
+                case .multiSlice(let slices):
+                    self?.handleMultiSlicePicture(slices: slices, sessionIsHardware: sessionIsHardware)
+                    return
+                case .failed:
                     self?.forceKeyframe()   // a dropped picture breaks the reference chain
                     return
                 }
+                self?.recordEncoded(since: now)
                 if key, eye == .right {
                     H264Encoder.log.warning("encoder produced an IDR on a right-eye frame")
                 }
@@ -147,9 +216,61 @@ final class H264Encoder: @unchecked Sendable {
         }
     }
 
+    private func recordEncoded(since submitted: Double) {
+        let latency = ProcessInfo.processInfo.systemUptime - submitted
+        withState { s in
+            s.framesEncoded += 1
+            s.encodeLatencySum += latency
+        }
+    }
+
+    /// A picture with `slices != 1` was dropped (the 3DS MVD decoder crashes on multi-slice
+    /// pictures). `.automatic` on the hardware encoder rebuilds once on the software encoder,
+    /// which honours `NumberOfSlices`; otherwise the picture is just dropped and logged. Either
+    /// way an IDR follows on the next left frame. Internal for tests.
+    func handleMultiSlicePicture(slices: Int, sessionIsHardware: Bool?) {
+        let (count, rebuild) = withState { s -> (Int, Bool) in
+            s.multiSliceDrops += 1
+            s.forceNextKeyframe = true
+            // Unknown (nil) counts as hardware: the rebuild happens at most once anyway.
+            let rebuild = sessionIsHardware != false && s.settings.encoder == .automatic
+                && s.softwareRebuilds == 0
+            if rebuild {
+                s.softwareRebuilds += 1
+                s.fellBackToSoftware = true
+                s.softwareRebuildPending = true
+            }
+            return (s.multiSliceDrops, rebuild)
+        }
+        if rebuild {
+            Self.log.fault("""
+                hardware encoder produced \(slices) slices in one picture (ignores NumberOfSlices); \
+                frame dropped, rebuilding the session on the software encoder
+                """)
+        } else if count == 1 || count.isMultiple(of: 60) {
+            Self.log.fault("""
+                encoder produced \(slices) slices in one picture; the 3DS requires exactly 1 \
+                (frame dropped, \(count) so far)
+                """)
+            // A software encoder that ignores NumberOfSlices is a bug worth stopping on in DEBUG.
+            assert(sessionIsHardware != false, "H.264 access unit has \(slices) slices; the 3DS needs single-slice pictures")
+        }
+    }
+
     // MARK: - Session
 
-    private static func makeSession(settings: Settings) -> VTCompressionSession? {
+    /// Creates a configured session, on the software encoder when `software` is true (falling
+    /// back to VideoToolbox's default choice if that fails).
+    static func makeSession(settings: Settings, software: Bool) -> SessionInfo? {
+        if software {
+            let spec = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanFalse!]
+            if let info = makeSession(settings: settings, specification: spec as CFDictionary) { return info }
+            log.error("software H.264 encoder unavailable; falling back to the default encoder")
+        }
+        return makeSession(settings: settings, specification: nil)
+    }
+
+    private static func makeSession(settings: Settings, specification: CFDictionary?) -> SessionInfo? {
         let sourceAttrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey: settings.width,
@@ -162,7 +283,7 @@ final class H264Encoder: @unchecked Sendable {
             width: settings.width,
             height: settings.height,
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
+            encoderSpecification: specification,
             imageBufferAttributes: sourceAttrs as CFDictionary,
             compressedDataAllocator: nil,
             outputCallback: nil,
@@ -173,22 +294,26 @@ final class H264Encoder: @unchecked Sendable {
             log.error("VTCompressionSessionCreate failed: \(status)")
             return nil
         }
-        func set(_ key: CFString, _ value: CFTypeRef) {
+        @discardableResult
+        func set(_ key: CFString, _ value: CFTypeRef) -> OSStatus {
             let st = VTSessionSetProperty(session, key: key, value: value)
             if st != noErr { log.warning("VTSessionSetProperty \(key as String) failed: \(st)") }
+            return st
         }
         set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel)
         // The 3DS MVD decoder only handles single-slice pictures. VideoToolbox's software H.264
         // encoder (simulator) splits pictures into 2-5 slices by default; "NumberOfSlices" is listed
         // by VTSessionCopySupportedPropertyDictionary but has no public constant. Set it where
         // supported; every output picture is verified in annexB(from:) either way.
+        var slicesStatus = "unsupported"
         if Self.supportsProperty(session, Self.numberOfSlicesKey) {
-            set(Self.numberOfSlicesKey, 1 as CFNumber)
+            slicesStatus = "OSStatus \(set(Self.numberOfSlicesKey, 1 as CFNumber))"
         }
         // One reference frame, like x264's stream that stays in sync on the 3DS (fewer DPB frames
         // to hold). Not every encoder supports it; the SPS rewrite below works either way.
+        var refsStatus = "unsupported"
         if Self.supportsProperty(session, kVTCompressionPropertyKey_ReferenceBufferCount) {
-            set(kVTCompressionPropertyKey_ReferenceBufferCount, 1 as CFNumber)
+            refsStatus = "OSStatus \(set(kVTCompressionPropertyKey_ReferenceBufferCount, 1 as CFNumber))"
         }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
@@ -205,7 +330,26 @@ final class H264Encoder: @unchecked Sendable {
         set(kVTCompressionPropertyKey_ExpectedFrameRate, settings.encoderFPS as CFNumber)
         applyBitrate(settings.bitrate, to: session)
         VTCompressionSessionPrepareToEncodeFrames(session)
-        return session
+        // The simulator does not report the property; a session created with the software-only
+        // specification is software either way.
+        let isHardware = usingHardwareEncoder(session) ?? (specification == nil ? nil : false)
+        let kind = isHardware.map { $0 ? "hardware" : "software" } ?? "unknown"
+        log.info("""
+            H.264 session \(settings.width)x\(settings.height)@\(settings.encoderFPS): \(kind) encoder \
+            (requested \(specification == nil ? "default" : "software")); NumberOfSlices=1 \(slicesStatus); \
+            ReferenceBufferCount=1 \(refsStatus)
+            """)
+        return SessionInfo(session: session, isHardware: isHardware)
+    }
+
+    private static func usingHardwareEncoder(_ session: VTCompressionSession) -> Bool? {
+        var value: CFTypeRef?
+        let st = withUnsafeMutablePointer(to: &value) {
+            VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                  allocator: nil, valueOut: UnsafeMutableRawPointer($0))
+        }
+        guard st == noErr, let value, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+        return CFBooleanGetValue((value as! CFBoolean))
     }
 
     static var numberOfSlicesKey: CFString { "NumberOfSlices" as CFString }
@@ -240,10 +384,22 @@ final class H264Encoder: @unchecked Sendable {
         return rewritten
     }
 
+    enum AnnexBResult {
+        case accessUnit(Data, isKey: Bool)
+        /// The picture does not have exactly one slice (count given); must be dropped.
+        case multiSlice(Int)
+        case failed
+    }
+
     /// Extracts an Annex-B access unit (SPS+PPS prepended on keyframes) from an encoder output.
     static func annexB(from sampleBuffer: CMSampleBuffer) -> (Data, Bool)? {
+        if case .accessUnit(let data, let key) = annexBResult(from: sampleBuffer) { return (data, key) }
+        return nil
+    }
+
+    static func annexBResult(from sampleBuffer: CMSampleBuffer) -> AnnexBResult {
         guard let block = CMSampleBufferGetDataBuffer(sampleBuffer),
-              let format = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
+              let format = CMSampleBufferGetFormatDescription(sampleBuffer) else { return .failed }
 
         var isKey = true
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
@@ -256,7 +412,7 @@ final class H264Encoder: @unchecked Sendable {
         let copyStatus = avcc.withUnsafeMutableBytes { raw in
             CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: raw.baseAddress!)
         }
-        guard copyStatus == kCMBlockBufferNoErr else { return nil }
+        guard copyStatus == kCMBlockBufferNoErr else { return .failed }
 
         var psCount = 0
         var nalLen: Int32 = 4
@@ -279,16 +435,12 @@ final class H264Encoder: @unchecked Sendable {
         }
         // The 3DS MVD decoder only handles single-slice pictures (multi-slice crashes its sysmodule).
         // makeSession requests one slice and never sets kVTCompressionPropertyKey_MaxH264SliceBytes;
-        // verify anyway: fatal in DEBUG, dropped (+ IDR requested) and logged in release.
+        // verify anyway: the caller drops it, logs, requests an IDR (handleMultiSlicePicture).
         let slices = AnnexB.sliceCount(avcc: avcc, nalLengthSize: Int(nalLen)) ?? 0
-        if slices != 1 {
-            log.fault("encoder produced \(slices) slices in one picture; the 3DS requires exactly 1 (frame dropped)")
-            assertionFailure("H.264 access unit has \(slices) slices; the 3DS needs single-slice pictures")
-            return nil
-        }
+        if slices != 1 { return .multiSlice(slices) }
         guard let annexB = AnnexB.convert(avcc: avcc, nalLengthSize: Int(nalLen), parameterSets: parameterSets,
                                             spsTransform: rewrittenParameterSet)
-        else { return nil }
-        return (annexB, isKey)
+        else { return .failed }
+        return .accessUnit(annexB, isKey: isKey)
     }
 }

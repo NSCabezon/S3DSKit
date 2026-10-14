@@ -201,11 +201,12 @@ See [`docs/ARCHITECTURE.md` › Hardware findings](docs/PROTOCOL.md#hardware-fin
 | Setting | Default | Notes |
 |---|---|---|
 | `layout` | `.alternating240x400` | The 3DS MVD decoder crashes on 240x800. |
-| `framesPerSecond` | 30 stereo pairs | 60 encoded fps (L, R, L, R…). |
-| `bitrate` | 1.5 Mbps | Clamped to 0.5–3 Mbps. Above ~2 Mbps risks stalls over the 3DS's Wi-Fi (2.5 Mbps stalled). |
-| `keyframeInterval` | 30 pairs | An IDR every 60 encoded frames (1 s), always on a **left** frame, with SPS+PPS before each IDR. |
-| `maxInFlightFrames` | 6 pairs | At most 12 AUs (200 ms) of video ahead. Beyond that, non-key frames are dropped and an IDR is forced on the next left frame. |
+| `framesPerSecond` | 20 stereo pairs | 40 encoded fps (L, R, L, R…). 30 pairs worked on a New 3DS XL with x264; lowered after Vision Pro device runs. |
+| `bitrate` | 1.2 Mbps | Clamped to 0.5–3 Mbps. Above ~2 Mbps risks stalls over the 3DS's Wi-Fi (2.5 Mbps stalled). |
+| `keyframeInterval` | 2 × `framesPerSecond` | An IDR every 2 s (80 encoded frames), always on a **left** frame, with SPS+PPS before each IDR. Forced IDRs (connect, `KEYFRAME_REQ`, oversize/multi-slice drops) are rate-limited to 1 per second. |
+| `maxInFlightFrames` | ≈ 250 ms | 5 pairs = 10 AUs at the default rate. Beyond that, video is dropped until the next **scheduled** keyframe; no extra IDR is forced (that caused IDR storms on a congested link). |
 | `audioBitrate` | 96 kbps | Opus, 48 kHz stereo, 20 ms. |
+| `encoder` | `.automatic` | Software H.264 encoder (see below). |
 
 The library always enforces the following:
 
@@ -214,8 +215,18 @@ The library always enforces the following:
   slices by default. S3DSKit sets the session property `NumberOfSlices = 1`, which
   `VTSessionCopySupportedPropertyDictionary` lists but has no public constant, and never sets
   `MaxH264SliceBytes`.
-  - It also checks every picture. A multi-slice picture triggers `assertionFailure` in DEBUG.
-  - In release, the picture is logged (`log.fault`) and dropped, and an IDR is requested.
+  - It also checks every picture. A multi-slice picture is logged (`log.fault`) and dropped, an
+    IDR is requested, and `stats.multiSlicePicturesDropped` counts it. From a software session
+    it also triggers an assertion in DEBUG.
+  - **Software encoder by default** (`encoder: .automatic`): the Vision Pro's hardware H.264
+    encoder was suspected of ignoring `NumberOfSlices` (being verified on device). On a real Vision
+    Pro, VideoToolbox ignores the software request and uses the hardware encoder, which so far
+    emitted no multi-slice pictures. 240x400 costs little CPU (~5 ms average latency per frame
+    at 60 fps in the simulator). If a hardware session is ever in use (software unavailable) and
+    emits a multi-slice picture, the session is rebuilt once on the software encoder.
+    `.software` never uses hardware; `.hardware` is VideoToolbox's default choice, and its
+    multi-slice pictures are only dropped. `stats.encoderIsHardware` shows which one is running,
+    and the session's choice is logged (`Logger` subsystem `S3DSKit`, category `encoder`).
 - H.264 Baseline, no B-frames (`AllowFrameReordering = false`), no AUD or SEI NALs.
 - **Zero output delay in the SPS.** VideoToolbox writes a VUI without `bitstream_restriction`,
   so a decoder may assume reordering and hold pictures before output. On the 3DS that desynced

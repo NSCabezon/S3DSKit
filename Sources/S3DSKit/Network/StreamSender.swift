@@ -24,7 +24,16 @@ public enum S3DSConnectionState: Equatable, Sendable {
 struct SenderCounters: Sendable {
     var framesSent = 0
     var bytesSent = 0
+    /// All dropped video frames (sum of the reasons below).
     var framesDropped = 0
+    /// Dropped because more than the in-flight budget was unsent (network backed up).
+    var backpressureDropped = 0
+    /// Dropped while waiting for the next keyframe after an earlier drop (can't decode without it).
+    var awaitingKeyframeDropped = 0
+    /// Dropped because the AU exceeded the 256 KiB payload limit.
+    var oversizeDropped = 0
+    /// Video AUs currently handed to the network and not yet sent.
+    var inFlight = 0
     var keyframesSent = 0
     var audioPacketsSent = 0
 }
@@ -36,7 +45,9 @@ struct SenderCounters: Sendable {
 final class StreamSender: @unchecked Sendable {
     struct Callbacks: Sendable {
         var stateChanged: @Sendable (S3DSConnectionState) -> Void
-        /// The encoder must produce an IDR next (connect, KEYFRAME_REQ, congestion recovery).
+        /// The encoder should produce an IDR soon (connect, KEYFRAME_REQ, oversize drop); the
+        /// encoder rate-limits forced IDRs. Never called for backpressure (that waits for the
+        /// next scheduled keyframe, avoiding IDR storms).
         var keyframeNeeded: @Sendable () -> Void
     }
 
@@ -51,7 +62,6 @@ final class StreamSender: @unchecked Sendable {
     private var generation = 0
     private var inFlight = 0
     private var needKeyframe = true
-    private var congested = false
     private var connected = false
     private var counters = SenderCounters()
 
@@ -62,7 +72,9 @@ final class StreamSender: @unchecked Sendable {
     }
 
     /// Snapshot of the counters (blocking hop to the sender queue; cheap).
-    var counterSnapshot: SenderCounters { queue.sync { counters } }
+    var counterSnapshot: SenderCounters {
+        queue.sync { var c = counters; c.inFlight = inFlight; return c }
+    }
 
     /// Opens a new connection, replacing any existing one.
     func connect(host: String, port: UInt16) {
@@ -108,19 +120,26 @@ final class StreamSender: @unchecked Sendable {
             let isKeyframe = rawKeyframe && eye != .right
             guard accessUnit.count <= S3DSProtocol.maxPayloadLength else {
                 Self.log.error("access unit too large (\(accessUnit.count) B), dropped")
+                counters.oversizeDropped += 1
                 drop(requestKeyframe: true)
                 return
             }
             if !isKeyframe {
-                if needKeyframe { counters.framesDropped += 1; return }
+                if needKeyframe {
+                    counters.framesDropped += 1
+                    counters.awaitingKeyframeDropped += 1
+                    return
+                }
                 if inFlight >= maxInFlight {
-                    congested = true
-                    drop(requestKeyframe: false)  // IDR is requested once the backlog drains
+                    // Stop video until the next scheduled keyframe; requesting an IDR here would
+                    // add a big frame to a congested link (IDR storm).
+                    counters.backpressureDropped += 1
+                    drop(requestKeyframe: false)
                     return
                 }
             } else if inFlight >= maxInFlight * 2 {
                 // Badly backed up: even keyframes would only add latency.
-                congested = true
+                counters.backpressureDropped += 1
                 drop(requestKeyframe: false)
                 return
             }
@@ -177,11 +196,6 @@ final class StreamSender: @unchecked Sendable {
         counters.framesSent += 1
         counters.bytesSent += bytes
         if keyframe { counters.keyframesSent += 1 }
-        if congested && inFlight < maxInFlight {
-            congested = false
-            needKeyframe = true
-            callbacks.keyframeNeeded()
-        }
     }
 
     private func handle(state: NWConnection.State, generation gen: Int) {
@@ -190,7 +204,6 @@ final class StreamSender: @unchecked Sendable {
         case .ready:
             connected = true
             inFlight = 0
-            congested = false
             needKeyframe = true
             connection?.send(content: S3DSProtocol.hello(name: senderName), completion: .idempotent)
             callbacks.keyframeNeeded()
@@ -221,7 +234,6 @@ final class StreamSender: @unchecked Sendable {
         connection = nil
         connected = false
         inFlight = 0
-        congested = false
         needKeyframe = true
     }
 
