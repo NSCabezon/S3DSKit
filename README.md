@@ -1,14 +1,17 @@
 # S3DSKit
 
 Swift package that streams stereo frames from a visionOS app to a New Nintendo 3DS running
-the 3DSStream receiver (`../3ds`), shown glasses-free on the 3DS top screen.
+the [3DSStream](https://github.com/NSCabezon/3DSStream) receiver, shown glasses-free on the 3DS
+top screen.
 
 It takes eye images (Metal textures, a RealityKit scene, or ready-made pixel buffers), scales
 and rotates them into the 3DS framebuffer layout on the GPU, encodes H.264 Baseline with
 VideoToolbox and sends it over TCP (Network.framework). No third-party dependencies.
 
 - Platforms: visionOS 26+ (Swift 6 language mode; works from Swift 5 mode apps too).
-- Video/wire contract: [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md).
+- Video/wire contract: [`docs/PROTOCOL.md`](docs/PROTOCOL.md), a copy of 3DSStream's
+  `docs/ARCHITECTURE.md`, which is the source of truth.
+- License: MIT.
 
 ## The stream in one paragraph
 
@@ -18,30 +21,24 @@ framebuffer-ready pixels. The default layout, `.alternating240x400`, sends one e
 frame, L, R, L, R at twice the stereo rate (60 fps for 30 stereo frames). Keyframes are always
 left frames, at least every second, with SPS+PPS before every IDR and no AUD NALs.
 `VIDEO_AU` flags: bit0 keyframe, bit1 eye (0 left, 1 right), bit2 alternating. The
-`.stacked240x800` layout puts both blocks in one 240x800 frame (left on top), but the 3DS MVD
-decoder crashes on 240x800, so use it only with receivers that support it. The 3DS is the TCP
+`.stacked240x800` layout puts both blocks in one 240x800 frame (left on top); only the
+alternating layout has been proven on hardware. The 3DS is the TCP
 server on port 7777. The app connects and sends `HELLO`, then `VIDEO_AU`s, and forces an IDR
 whenever the 3DS sends `KEYFRAME_REQ`.
 
 ## Adding the package
 
-The package lives in the `visionos/` subdirectory of the 3DSStream repo:
-
-- **Local path** (simplest): Xcode ▸ File ▸ Add Package Dependencies… ▸ Add Local… ▸ pick
-  `3DSStream/visionos`. With XcodeGen:
+- **Git URL:** Xcode ▸ File ▸ Add Package Dependencies… ▸ `https://github.com/NSCabezon/S3DSKit`.
+- **Local path:** Add Local… ▸ pick your `S3DSKit` checkout. With XcodeGen:
   ```yaml
   packages:
     S3DSKit:
-      path: ../3DSStream/visionos
+      path: ../S3DSKit
   targets:
     MyApp:
       dependencies:
         - package: S3DSKit
   ```
-- **Git URL**: SwiftPM needs `Package.swift` at the root of the repository, so a URL to the
-  3DSStream repo does **not** work as is. To consume it by URL, publish `visionos/` as its own
-  repository (e.g. `git subtree split --prefix visionos -b s3dskit` and push that branch to a
-  new repo), then add that repo's URL.
 
 **Info.plist (required):** `NSLocalNetworkUsageDescription`, e.g. "Streams 3D video to your
 Nintendo 3DS on the local network." Without it visionOS blocks the LAN connection. The Vision
@@ -181,7 +178,7 @@ are asynchronous, so audio and video do not wait on each other.
 ## Recommended settings / hardware notes
 
 The defaults are the settings proven on a New 3DS XL: 29.9 stereo pairs/s with 0 decode errors.
-See [`docs/ARCHITECTURE.md` › Hardware findings](../docs/ARCHITECTURE.md#hardware-findings-new-3ds-xl-2026-10-14).
+See [`docs/ARCHITECTURE.md` › Hardware findings](docs/PROTOCOL.md#hardware-findings-new-3ds-xl-2026-10-14).
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -247,4 +244,4 @@ ffprobe -v error -show_streams -count_frames <path>/s3ds_alternating.h264   # 24
 ffmpeg -i <path>/s3ds_alternating.h264 -vf "select=between(n\,40\,41),transpose=cclock,tile=2x1" -frames:v 1 pair.png
 ```
 
-Use `../tools/recv_sim.py` as a fake 3DS on the Mac when testing a real app in the simulator.
+Use 3DSStream's `tools/recv_sim.py` as a fake 3DS on the Mac when testing a real app in the simulator.
