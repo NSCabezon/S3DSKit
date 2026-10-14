@@ -30,9 +30,17 @@ Zero warnings. The integration tests run a fake 3DS on an ephemeral local port. 
 
 ## Status (2026-10-14)
 
-65 tests pass. Not yet verified on a real Vision Pro: that its hardware encoder honors
-`NumberOfSlices` (a DEBUG build asserts if not). First intended consumer is one of the user's own visionOS apps;
-don't modify other repos without the user's OK.
+65 tests pass. Published release 0.1.0 on github.com/NSCabezon/S3DSKit. These later commits are
+local only, not pushed yet: SPS bitstream_restriction rewrite (2ec53b7), deadline throttle + audio
+stats (7226aa2). Release them as 0.1.1 once they're verified on the device.
+
+First real-device run (a visionOS game app at 90 Hz, built against the pre-split package): stereo
+works, and the right-eye lag is fixed by the SPS rewrite plus the receiver's SPS patch. Still to
+check with a fresh build: the ~88 fps / 2.4 Mbps seen on the 3DS (the old throttle is correct in
+simulation, so the cause is unknown), the excess audio (use the new audio stats), and whether the
+hardware encoder honours `NumberOfSlices` (a DEBUG build asserts).
+
+Don't modify other repos (the user's apps) without the user's OK.
 
 ## Delegation
 
