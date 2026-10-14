@@ -190,7 +190,7 @@ struct IntegrationTests {
     }
 }
 
-/// Compile check: the one-line integration in a @MainActor frame pump (tc-visionos FramePump shape).
+/// Compile check: the one-line integration in a @MainActor frame pump (typical frame-pump shape).
 @MainActor
 final class FramePumpShape {
     let streamer = S3DSStreamer()

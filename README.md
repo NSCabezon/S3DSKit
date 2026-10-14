@@ -61,8 +61,8 @@ streamer.connect(host: "192.168.1.50")     // IP shown on the 3DS bottom screen;
 ### 1. Texture pair: your app already has eye images
 
 Call it every display frame. The built-in throttle passes `framesPerSecond` (default 30) and
-returns `false` from extra calls without doing any work. In the tc-visionos `FramePump.pump`,
-before `cb.commit()`:
+returns `false` from extra calls without doing any work. For example, in a frame pump that copies
+an emulator's stereo frame each display frame, before `cb.commit()`:
 
 ```swift
 streamer.submit(left: frame.left, right: frame.right, commandBuffer: cb)
@@ -159,8 +159,8 @@ The submit calls are **real-time safe**. They only copy into a ring buffer, hold
 `os_unfair_lock` for the copy and allocating nothing. Resampling, upmixing and encoding run on
 a background queue. Any sample rate works; mono is sent to both channels.
 
-tc-visionos: its `GameCore` audio pull produces mono Float32 at 48 kHz on the audio thread.
-Hand each rendered block to the streamer from that same callback:
+Example: a game core that produces mono Float32 at 48 kHz on its audio thread. Hand each
+rendered block to the streamer from that same callback:
 
 ```swift
 // inside the audio render block, after filling `out` (frameCount mono Float32 samples):

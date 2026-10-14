@@ -28,8 +28,8 @@ Zero warnings. The integration tests run a fake 3DS on an ephemeral local port. 
 ## Status (2026-10-14)
 
 44 tests pass. Not yet verified on a real Vision Pro: that its hardware encoder honors
-`NumberOfSlices` (a DEBUG build asserts if not). First intended consumer: `~/Apps/tc-visionos`;
-don't modify it without the user's OK.
+`NumberOfSlices` (a DEBUG build asserts if not). First intended consumer is one of the user's own visionOS apps;
+don't modify other repos without the user's OK.
 
 ## Delegation
 
