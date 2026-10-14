@@ -86,7 +86,10 @@ final class StreamEngine: @unchecked Sendable {
         options = Mutex(configuration.frameOptions)
         var policy = configuration.congestion
         policy.adaptiveBitrate = configuration.adaptiveBitrate
-        congestion = Mutex(CongestionController(policy: policy, bitrate: configuration.bitrate))
+        congestion = Mutex(CongestionController(
+            policy: policy, bitrate: configuration.bitrate,
+            framesPerSecond: configuration.framesPerSecond * configuration.layout.framesPerPair,
+            audioBitrate: configuration.audioEnabled ? configuration.audioBitrate : 0))
         (events, continuation) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .bufferingNewest(16))
 
         let link = SenderLink()
@@ -281,9 +284,10 @@ final class StreamEngine: @unchecked Sendable {
     private func recordPair(skipped: Bool, backlog: Double? = nil) {
         let now = CACurrentMediaTime()
         let seen = backlog ?? sender.backlogSeconds()
+        let link = sender.linkSample()
         guard let (old, rate) = congestion.withLock({ c -> (Int, Int)? in
             let old = c.bitrate
-            return c.record(at: now, skipped: skipped, backlog: seen).map { (old, $0) }
+            return c.record(at: now, skipped: skipped, backlog: seen, link: link).map { (old, $0) }
         }) else { return }
         encoder.setBitrate(rate)
         sender.setDrainRate(rate + audioBitrate)

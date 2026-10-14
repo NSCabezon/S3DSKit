@@ -35,7 +35,9 @@ then re-copy it here.
     requests an IDR once the backlog is < 150 ms, never while congested; `KEYFRAME_REQ` is held
     back the same way.
   - Adaptive bitrate: > 20 % of a 2 s window's pairs skipped, or the window's average backlog
-    ≥ 100 ms → ×0.8 (floor 0.5 Mbps); 5 s without a skip or a backed-up window → ×1.1 up to the
+    ≥ 100 ms → ×0.8, or straight to the link fit when lower: (0.85 × bytes the 3DS acked over
+    the window − audio) ÷ the encoder's measured overshoot (the Vision Pro HW encoder runs
+    20-50 % over its target) (floor 0.5 Mbps); 5 s without a skip or a backed-up window → ×1.1 up to the
     configured bitrate. `stats.videoBitrate`. `setStartBitrate` starts below the ceiling (apps
     pass the rate that last worked with that receiver). Device run: the backlog trigger exists
     because a link just under the bitrate held 1.2 Mbps for 12 s at 5-15 % skips.

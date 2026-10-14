@@ -91,6 +91,28 @@ struct CongestionControllerTests {
         #expect(down == [960_000, 768_000, 614_400])
     }
 
+    /// The device case with link measurements: 1.5 Mbps asked, the encoder producing 30 % more,
+    /// the 3DS acknowledging ~900 kbps. The first congested window jumps straight to the bitrate
+    /// that fits (0.85 × 900k − audio) / 1.3 instead of ×0.8 steps.
+    @Test func congestedWindowStepsStraightToTheLinkFit() {
+        var c = CongestionController(policy: Self.policy, bitrate: 1_500_000, framesPerSecond: 40,
+                                     audioBitrate: 96_000)
+        let bytesPerFrame = 1.3 * 1_500_000 / 40 / 8
+        var changes: [Int] = []
+        for i in 0..<41 {   // 20 pairs/s for 2 s; every pair sent (2 AUs)
+            let t = Double(i) / 20
+            let link = LinkSample(delivered: Int(900_000.0 / 8 * t), videoBytes: Int(bytesPerFrame * Double(2 * i)),
+                                  videoFrames: 2 * i)
+            if let b = c.record(at: t, skipped: false, backlog: 0.12, link: link) { changes.append(b) }
+        }
+        let fit = (0.85 * 900_000 - 96_000) / 1.3
+        #expect(changes.count == 1)
+        #expect(abs(Double(changes[0]) - fit) < 0.02 * fit)
+        // Without link samples (or an uncongested window) the old ×0.8 step applies.
+        var d = CongestionController(policy: Self.policy, bitrate: 1_500_000)
+        #expect(Self.run(&d, from: 0, seconds: 2.06, backlog: 0.12, skipEvery: nil) == [1_200_000])
+    }
+
     @Test func clearLinkBacklogDoesNotStepDown() {
         var c = CongestionController(policy: Self.policy, bitrate: 1_200_000)
         // 0-40 ms of backlog (the device's healthy range) never lowers the bitrate.

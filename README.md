@@ -277,7 +277,9 @@ the link carries, S3DSKit keeps the latency bounded without breaking the H.264 s
    bitrate much: VideoToolbox's rate control spends the same bits per second on fewer frames. So
    while more than 20 % of the pairs in a 2 s window are skipped, or the backlog averaged over
    the window is at least 100 ms (a link just under the bitrate skips few pairs but stays backed
-   up), the bitrate drops by 20 % (floor 0.5 Mbps); after 5 s without a skip or a backed-up
+   up), the bitrate drops by 20 %, or straight to what fits the link if that is lower: 85 % of
+   what the 3DS acknowledged over the window, minus audio, divided by how far the encoder ran
+   over its target (hardware encoders overshoot by 20-50 %) (floor 0.5 Mbps); after 5 s without a skip or a backed-up
    window it rises by 10 %, up to `bitrate`. `stats.videoBitrate` is the value in use. To skip
    the first seconds of stepping down on a known link, call `setStartBitrate(_:)` after
    connecting with the rate that last worked (for example a saved `stats.videoBitrate`).

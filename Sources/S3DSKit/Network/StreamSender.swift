@@ -74,6 +74,11 @@ final class StreamSender: @unchecked Sendable {
     /// Bits per second assumed to drain the backlog: the stream's own rate (video + audio). When
     /// the link is the bottleneck it drains slower, so the estimate errs towards sending.
     private let drainRate = Atomic<Int>(1_200_000)
+    /// Running totals for measuring the link (`linkSample`): every byte handed to the socket
+    /// (video and audio), and the video AUs among them.
+    private let socketBytesTotal = Atomic<Int>(0)
+    private let videoBytesTotal = Atomic<Int>(0)
+    private let videoFramesTotal = Atomic<Int>(0)
     /// How often the socket backlog is sampled while connected.
     static let backlogSampleInterval = DispatchTimeInterval.milliseconds(10)
 
@@ -128,6 +133,15 @@ final class StreamSender: @unchecked Sendable {
 
     /// Unacknowledged bytes in the TCP send buffer at the last sample.
     var socketBacklog: Int { socketBacklogBytes.load(ordering: .relaxed) }
+
+    /// Running totals for the bitrate adaptation: bytes the 3DS has acknowledged (handed to the
+    /// socket minus still unacknowledged; video and audio), and the video bytes and AUs sent.
+    /// Lock-free; safe from any thread.
+    func linkSample() -> LinkSample {
+        LinkSample(delivered: socketBytesTotal.load(ordering: .relaxed) - socketBacklogBytes.load(ordering: .relaxed),
+                   videoBytes: videoBytesTotal.load(ordering: .relaxed),
+                   videoFrames: videoFramesTotal.load(ordering: .relaxed))
+    }
 
     /// Bits per second the stream is meant to use (video + audio); scales `backlogSeconds`.
     func setDrainRate(_ bitsPerSecond: Int) {
@@ -237,6 +251,7 @@ final class StreamSender: @unchecked Sendable {
                 }
                 self.counters.audioPacketsSent += 1
                 self.counters.bytesSent += message.count
+                self.socketBytesTotal.add(message.count, ordering: .relaxed)
             })
         }
     }
@@ -296,6 +311,9 @@ final class StreamSender: @unchecked Sendable {
         }
         counters.framesSent += 1
         counters.bytesSent += bytes
+        socketBytesTotal.add(bytes, ordering: .relaxed)
+        videoBytesTotal.add(bytes, ordering: .relaxed)
+        videoFramesTotal.add(1, ordering: .relaxed)
         if keyframe { counters.keyframesSent += 1 }
         requestRecoveryKeyframeIfDrained()
     }
