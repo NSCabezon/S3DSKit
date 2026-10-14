@@ -1,6 +1,13 @@
+<p align="center"><img src="docs/logo.png" width="140" alt="3D Streaming logo"></p>
+
 # S3DSKit
 
-Swift package that streams stereo frames from a visionOS app to a New Nintendo 3DS running
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform: visionOS 26+](https://img.shields.io/badge/platform-visionOS%2026%2B-lightgrey)
+![Swift 6](https://img.shields.io/badge/Swift-6-orange)
+[![SwiftPM](https://img.shields.io/badge/SwiftPM-compatible-brightgreen)](#adding-the-package)
+
+Swift package that streams stereo frames (and audio) from a visionOS app to a New Nintendo 3DS running
 the [3DSStream](https://github.com/NSCabezon/3DSStream) receiver, shown glasses-free on the 3DS
 top screen.
 
@@ -28,7 +35,11 @@ whenever the 3DS sends `KEYFRAME_REQ`.
 
 ## Adding the package
 
-- **Git URL:** Xcode ▸ File ▸ Add Package Dependencies… ▸ `https://github.com/NSCabezon/S3DSKit`.
+- **Git URL:** Xcode ▸ File ▸ Add Package Dependencies… ▸ `https://github.com/NSCabezon/S3DSKit`,
+  rule "Up to Next Major Version" from `0.1.0`. In `Package.swift`:
+  ```swift
+  .package(url: "https://github.com/NSCabezon/S3DSKit", from: "0.1.0")
+  ```
 - **Local path:** Add Local… ▸ pick your `S3DSKit` checkout. With XcodeGen:
   ```yaml
   packages:
