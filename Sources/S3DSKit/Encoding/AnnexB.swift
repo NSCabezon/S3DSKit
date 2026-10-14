@@ -15,8 +15,11 @@ enum AnnexB {
     ///   - nalLengthSize: 1, 2 or 4 (VideoToolbox uses 4).
     ///   - parameterSets: when non-nil (keyframes), these NALs (SPS, PPS) are emitted first and
     ///     any in-band SPS/PPS in `avcc` are skipped to avoid duplicates.
+    ///   - spsTransform: applied to any in-band SPS NAL that is kept (non-keyframes), so every SPS
+    ///     that goes out gets the same treatment as `parameterSets`.
     /// - Returns: the Annex-B bytes, or nil if `avcc` is malformed.
-    static func convert(avcc: Data, nalLengthSize: Int, parameterSets: [Data]? = nil) -> Data? {
+    static func convert(avcc: Data, nalLengthSize: Int, parameterSets: [Data]? = nil,
+                        spsTransform: ((Data) -> Data)? = nil) -> Data? {
         guard [1, 2, 4].contains(nalLengthSize) else { return nil }
         var out = Data(capacity: avcc.count + 64)
         if let parameterSets {
@@ -40,7 +43,11 @@ enum AnnexB {
                 let skip = droppedNALTypes.contains(type) || (skipParamSets && (type == 7 || type == 8))
                 if !skip {
                     out.append(contentsOf: startCode)
-                    out.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<(i + len)]))
+                    if type == 7, let spsTransform {
+                        out.append(spsTransform(Data(UnsafeBufferPointer(rebasing: bytes[i..<(i + len)]))))
+                    } else {
+                        out.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<(i + len)]))
+                    }
                 }
                 i += len
             }

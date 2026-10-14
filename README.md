@@ -210,6 +210,13 @@ The library always enforces the following:
   - It also checks every picture. A multi-slice picture triggers `assertionFailure` in DEBUG.
   - In release, the picture is logged (`log.fault`) and dropped, and an IDR is requested.
 - H.264 Baseline, no B-frames (`AllowFrameReordering = false`), no AUD or SEI NALs.
+- **Zero output delay in the SPS.** VideoToolbox writes a VUI without `bitstream_restriction`,
+  so a decoder may assume reordering and hold pictures before output. On the 3DS that desynced
+  the eyes (the right eye showed an older picture). S3DSKit rewrites every SPS it sends to add
+  `bitstream_restriction` with `max_num_reorder_frames = 0` and
+  `max_dec_frame_buffering = max(1, max_num_ref_frames)` (like x264), all other fields unchanged.
+  An SPS it cannot parse is sent unchanged and logged once. It also asks for
+  `ReferenceBufferCount = 1` where the encoder supports it (the simulator's does not).
 - A `VIDEO_AU` payload may be at most 256 KiB, the receiver's limit. A larger AU is dropped and an
   IDR is forced on the next left frame. An `AUDIO` payload may be at most 4 KiB.
 
@@ -236,7 +243,7 @@ xcodebuild test  -scheme S3DSKit -destination 'platform=visionOS Simulator,name=
 
 `swift test` cannot run visionOS tests, so use `xcodebuild`. The suite covers:
 
-- protocol framing, AVCC→Annex-B, slice counting, mapping, fit and letterbox math, camera math,
+- protocol framing, AVCC→Annex-B, the SPS `bitstream_restriction` rewrite, slice counting, mapping, fit and letterbox math, camera math,
   and the hardware defaults;
 - GPU kernel exactness, pixel by pixel, for both layouts;
 - encoder keyframe placement (IDR only on left frames, deferred requests);

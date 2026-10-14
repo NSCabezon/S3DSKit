@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import Synchronization
 import VideoToolbox
 import os
 
@@ -184,6 +185,11 @@ final class H264Encoder: @unchecked Sendable {
         if Self.supportsProperty(session, Self.numberOfSlicesKey) {
             set(Self.numberOfSlicesKey, 1 as CFNumber)
         }
+        // One reference frame, like x264's stream that stays in sync on the 3DS (fewer DPB frames
+        // to hold). Not every encoder supports it; the SPS rewrite below works either way.
+        if Self.supportsProperty(session, kVTCompressionPropertyKey_ReferenceBufferCount) {
+            set(kVTCompressionPropertyKey_ReferenceBufferCount, 1 as CFNumber)
+        }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
         let keyDuration = Double(settings.keyframeInterval) / Double(max(1, settings.fps))
@@ -204,7 +210,7 @@ final class H264Encoder: @unchecked Sendable {
 
     static var numberOfSlicesKey: CFString { "NumberOfSlices" as CFString }
 
-    private static func supportsProperty(_ session: VTCompressionSession, _ key: CFString) -> Bool {
+    static func supportsProperty(_ session: VTCompressionSession, _ key: CFString) -> Bool {
         var dict: CFDictionary?
         guard VTSessionCopySupportedPropertyDictionary(session, supportedPropertyDictionaryOut: &dict) == noErr,
               let keys = dict as? [String: Any] else { return false }
@@ -219,6 +225,20 @@ final class H264Encoder: @unchecked Sendable {
     }
 
     // MARK: - Output conversion
+
+    /// Last (encoder SPS, rewritten SPS). The format description, and so its SPS, only changes
+    /// when the session is rebuilt, so this skips re-parsing on every keyframe.
+    private static let spsCache = Mutex<(original: Data, rewritten: Data)?>(nil)
+
+    /// SPS NALs get `bitstream_restriction` with zero reordering (see `SPSRewriter`); PPS and
+    /// anything else pass through.
+    static func rewrittenParameterSet(_ nal: Data) -> Data {
+        guard let first = nal.first, first & 0x1F == 7 else { return nal }
+        if let cached = spsCache.withLock({ $0 }), cached.original == nal { return cached.rewritten }
+        let rewritten = SPSRewriter.rewrite(nal)
+        spsCache.withLock { $0 = (nal, rewritten) }
+        return rewritten
+    }
 
     /// Extracts an Annex-B access unit (SPS+PPS prepended on keyframes) from an encoder output.
     static func annexB(from sampleBuffer: CMSampleBuffer) -> (Data, Bool)? {
@@ -255,7 +275,7 @@ final class H264Encoder: @unchecked Sendable {
                     parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
                 if st == noErr, let ptr { sets.append(Data(bytes: ptr, count: size)) }
             }
-            parameterSets = sets
+            parameterSets = sets.map(rewrittenParameterSet)
         }
         // The 3DS MVD decoder only handles single-slice pictures (multi-slice crashes its sysmodule).
         // makeSession requests one slice and never sets kVTCompressionPropertyKey_MaxH264SliceBytes;
@@ -266,7 +286,8 @@ final class H264Encoder: @unchecked Sendable {
             assertionFailure("H.264 access unit has \(slices) slices; the 3DS needs single-slice pictures")
             return nil
         }
-        guard let annexB = AnnexB.convert(avcc: avcc, nalLengthSize: Int(nalLen), parameterSets: parameterSets)
+        guard let annexB = AnnexB.convert(avcc: avcc, nalLengthSize: Int(nalLen), parameterSets: parameterSets,
+                                            spsTransform: rewrittenParameterSet)
         else { return nil }
         return (annexB, isKey)
     }

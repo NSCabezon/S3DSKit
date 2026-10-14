@@ -13,6 +13,9 @@ then re-copy it here.
 - Defaults are the hardware-proven ones: alternating 240x400 at 60 fps, 1.5 Mbps, an IDR every
   60 frames and only on LEFT frames, Baseline, ≤ 256 KiB per AU, ≤ 200 ms of video in flight, Opus
   48 kHz stereo 20 ms 96 kbps. `DefaultsTests` asserts them.
+- Every SPS sent goes through `SPSRewriter` (`bitstream_restriction`, `max_num_reorder_frames = 0`,
+  `max_dec_frame_buffering = max(1, refs)`). Without it the 3DS decoder delays output and the
+  right eye shows an older picture than the left. Never send VideoToolbox's SPS raw.
 - `submit…`/`submitAudio` are nonisolated and must never block the caller (no
   `waitUntilCompleted`, no allocation on the audio path).
 
@@ -27,7 +30,7 @@ Zero warnings. The integration tests run a fake 3DS on an ephemeral local port. 
 
 ## Status (2026-10-14)
 
-44 tests pass. Not yet verified on a real Vision Pro: that its hardware encoder honors
+55 tests pass. Not yet verified on a real Vision Pro: that its hardware encoder honors
 `NumberOfSlices` (a DEBUG build asserts if not). First intended consumer is one of the user's own visionOS apps;
 don't modify other repos without the user's OK.
 

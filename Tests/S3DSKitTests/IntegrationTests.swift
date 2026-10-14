@@ -53,6 +53,11 @@ struct IntegrationTests {
             #expect(!t.contains(9))                                 // no AUD
             #expect(t.filter { $0 == 1 || $0 == 5 }.count == 1)     // single slice (3DS MVD)
             if t.contains(5) { #expect(Array(t.prefix(2)) == [7, 8]) }
+            if let spsNAL = firstNAL(ofType: 7, in: au.payload) {   // zero-delay output (3DS eye sync)
+                let sps = try SPSRewriter.parse(spsNAL)
+                let r = try #require(sps.vui?.restriction)
+                #expect(r.maxNumReorderFrames == 0 && r.maxDecFrameBuffering >= max(1, sps.maxNumRefFrames))
+            }
         }
         #expect(aus.filter { $0.header.flags & 1 != 0 }.count >= 2)   // keyframe interval ≤ 1 s
 
